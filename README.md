@@ -42,9 +42,10 @@ Windows the chords use `Ctrl+Alt+Shift` instead of `⌘⌥⇧`.
 | Jump to next agent waiting for input | `next_waiting` | `⌘⌥⇧J` | Focuses the next agent (by pane id, wrapping) whose state is `waiting_input`, switching session when needed. |
 | Remove a finished agent's worktree | `cleanup` | | Picks a worktree no running agent (or subagent) works in; `git worktree remove`, asking first when it has uncommitted changes (then `--force`). The branch is kept. |
 
-The status line shows `<project> · N working · M waiting` for a focused pane inside a project; a
-click toggles the dashboard. A toast tells you when an agent you are not looking at needs input,
-finishes or fails.
+The status line always has a Projects segment: `<project> · N working · M waiting` for a focused
+pane inside a project, else `Projects` (with the waiting count across all projects when any agent
+needs input). A click toggles the dashboard, as does the sidebar button in the Files pane's header
+(`⌘O`). A toast tells you when an agent you are not looking at needs input, finishes or fails.
 
 ### Dashboard
 

@@ -1024,11 +1024,25 @@ tern.timer(0, function(cx)
 end)
 
 -- Pure: reads only the caches `scan` fills, which calls tern.chrome.refresh() on change.
+-- Always shows one segment, so the dashboard is one click away from any pane: the focused
+-- pane's project with its counts, else "Projects" with the waiting count across all projects.
 local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
+	local command = "plugin." .. ID .. ".dashboard"
 	local id = pane_project[pane.pane]
 	local p = if id then model.get(state, id) else model.project_for_path(state, pane.cwd)
 	if p == nil then
-		return nil
+		local waiting = 0
+		for _, c in counts do
+			waiting += c.waiting
+		end
+		return {
+			{
+				text = if waiting > 0 then string.format("Projects · %d waiting", waiting) else "Projects",
+				icon = "folder",
+				tone = if waiting > 0 then "warn" else nil,
+				command = command,
+			},
+		}
 	end
 	local c = counts[p.id] or { working = 0, waiting = 0 }
 	return {
@@ -1036,9 +1050,18 @@ local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
 			text = string.format("%s · %d working · %d waiting", p.name, c.working, c.waiting),
 			icon = "folder",
 			tone = if c.waiting > 0 then "warn" else nil,
-			command = "plugin." .. ID .. ".dashboard",
+			command = command,
 		},
 	}
 end
 
 tern.chrome.status(status_segments)
+
+tern.files.button({
+	id = "dashboard",
+	title = "Toggle projects dashboard",
+	icon = "sidebar",
+	run = function(_files, cx)
+		toggle_dashboard(cx)
+	end,
+})
