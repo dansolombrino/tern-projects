@@ -478,10 +478,22 @@ local function set_visible(visible: boolean)
 end
 
 -- Shows the sidebar at the left of the current tab, leaving focus where it is.
-local function show_side(cx: WindowCx)
+local function show_side(cx: WindowCx, retried: boolean?)
 	set_visible(true)
 	S.scan(cx)
 	local main = main_pane(cx, S.side_pane)
+	if main == nil and not retried then
+		-- A session with no pane left (its last agent slept or closed) has nothing to dock beside: the
+		-- sidebar would stay parked and its sleeping cards out of reach. Give it a shell, and dock once
+		-- the session has it.
+		cx.layout:new_tab()
+		tern.timer(200, function(tcx)
+			if tcx then
+				show_side(tcx, true)
+			end
+		end)
+		return
+	end
 	local side = find_side(cx)
 	if side and not place(cx, side) then
 		cx.layout:close(side)
