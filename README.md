@@ -40,7 +40,7 @@ Windows the chords use `Ctrl+Alt+Shift` instead of `⌘⌥⇧`.
 | New subagent of focused agent | `new_subagent` | `⌘⌥⇧U` | Asks for a task and starts a child agent split beside the focused agent, with report-back. |
 | Toggle projects dashboard | `dashboard` | `⌘⌥⇧D` | Opens or closes the dashboard canvas as a left sidebar (28%) beside the focused pane. |
 | Jump to next agent waiting for input | `next_waiting` | `⌘⌥⇧J` | Focuses the next agent (by pane id, wrapping) whose state is `waiting_input`, switching session when needed. |
-| Remove a finished agent's worktree | `cleanup` | | Picks a closed agent that owns a worktree; `git worktree remove`, asking first when the worktree has uncommitted changes (then `--force`). The branch is kept. |
+| Remove a finished agent's worktree | `cleanup` | | Picks a worktree no running agent (or subagent) works in; `git worktree remove`, asking first when it has uncommitted changes (then `--force`). The branch is kept. |
 
 The status line shows `<project> · N working · M waiting` for a focused pane inside a project; a
 click toggles the dashboard. A toast tells you when an agent you are not looking at needs input,
@@ -81,13 +81,14 @@ canvas nodes), `tests/` (pure tests: `luau tests/<file>.luau`).
 
 - Pane ids key the records: agents restored by a Tern restart that changes pane ids lose their
   title, worktree and parent links (they still show, attributed by folder).
-- Report-back fires on every turn end of a spawned subagent (`done` or `failed`) whose last message
-  changed, while the parent agent is alive; a parent with a prompt already pending refuses it (a
-  toast says so).
+- Report-back fires on every turn end of a spawned subagent (`done` or `failed`) that produced a new
+  answer (omp's stats footer stripped), while the parent agent is alive. Reports to a working parent
+  wait for its next idle; one Tern refuses is retried at the parent's next state change (a toast says
+  so). The in-memory queue is lost on a plugin reload.
 - omp-internal subagents are read from at most 2000 surface nodes per agent; a longer transcript
   can hide older ones. They are read only while the dashboard is open.
 - Paths are local: projects on remote hosts aren't supported (git and file checks run on this
   machine).
 - The dashboard opens in the current tab; switching sessions leaves it behind (toggle it again in
   the other session).
-- `cleanup` removes only worktrees of closed agents, never branches.
+- `cleanup` removes only worktrees no live agent works in, never branches.
