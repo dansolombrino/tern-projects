@@ -40,8 +40,23 @@ section.tn-pane:has(.op-sidebar) .tv-cover {
 	border-radius: 0 !important;
 	background: transparent !important;
 }
+/* Flush with the pane: Tern insets the canvas cover by the terminal grid's 10px padding and pads its regions. */
 section.tn-pane:has(.op-sidebar) .tv-cover {
+	inset: 0 !important;
 	padding: 0 1px 0 0 !important;
+}
+section.tn-pane:has(.op-sidebar) .sf-region {
+	padding: 0 !important;
+}
+
+/* Orca's list scrollbar: thin, thumb hidden until the sidebar is hovered, then muted 28%. Tern's style engine
+   has scrollbar-width/-color only (no ::-webkit-scrollbar parts), so thumb hover/drag tints stay out. */
+section.tn-pane:has(.op-sidebar) {
+	scrollbar-width: thin;
+	scrollbar-color: transparent transparent;
+}
+section.tn-pane:has(.op-sidebar):hover {
+	scrollbar-color: light-dark(rgba(105, 105, 105, .28), rgba(172, 172, 172, .28)) transparent;
 }
 
 /* The title bar's Files button becomes Orca's sidebar toggle: leading edge, PanelLeft glyph,
@@ -70,6 +85,7 @@ section.tn-pane:has(.op-sidebar) .tv-cover {
 .tb-in > .tb-files.tn-files-t > * {
 	display: none !important;
 }
+/* PanelLeft, colored by Tern's theme (`html[data-theme]`), not the OS: no CSS masks in Tern, so one stroke color per state. */
 .tb-in > .tb-files.tn-files-t::after {
 	content: "";
 	display: block;
@@ -78,21 +94,16 @@ section.tn-pane:has(.op-sidebar) .tv-cover {
 	background: no-repeat center / 16px 16px url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23696969' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
 }
 .tb-in > .tb-files.tn-files-t:hover {
-	background: #f5f5f5;
+	background: light-dark(#f5f5f5, #404040);
 }
 .tb-in > .tb-files.tn-files-t:hover::after {
 	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230a0a0a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
 }
-@media (prefers-color-scheme: dark) {
-	.tb-in > .tb-files.tn-files-t::after {
-		background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23acacac' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
-	}
-	.tb-in > .tb-files.tn-files-t:hover {
-		background: #404040;
-	}
-	.tb-in > .tb-files.tn-files-t:hover::after {
-		background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f0f0f0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
-	}
+html[data-theme='dark'] .tb-in > .tb-files.tn-files-t::after {
+	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23acacac' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
+}
+html[data-theme='dark'] .tb-in > .tb-files.tn-files-t:hover::after {
+	background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f0f0f0' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><rect width='18' height='18' x='3' y='3' rx='2'/><path d='M9 3v18'/></svg>");
 }
 
 /* Its tooltip names what it does now (the keycaps stay: ⌃⌘E runs the same override). */

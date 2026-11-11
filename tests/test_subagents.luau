@@ -111,4 +111,43 @@ test("synthetic: depth from nesting, dedup, spans, bare node", function()
 	check(list[5].id ~= "" and list[5].id ~= list[4].id, "generated id for id-less node")
 end)
 
+test("running: live ones, flattened owners first", function()
+	local function mk(name, depth, status)
+		return { id = name, name = name, depth = depth, status = status }
+	end
+	local function names(list)
+		local out = {}
+		for _, s in list do
+			table.insert(out, s.name)
+		end
+		return table.concat(out, ",")
+	end
+	local list = {
+		mk("A", 0, "done"),
+		mk("A1", 1, "running"),
+		mk("A2", 1, "pending"),
+		mk("B", 0, "running"),
+		mk("B1", 1, "pending"),
+		mk("C", 0, "failed"),
+		mk("C1", 1, "done"),
+		mk("D", 0, "pending"),
+		mk("E", 0, "aborted"),
+		mk("E1", 1, "done"),
+		mk("E2", 2, "running"),
+	}
+	eq(names(subagents.running(list)), "A,A1,B,B1,D,E,E1,E2", "settled owners only above running work; stale pending dropped")
+	eq(#subagents.running({}), 0, "empty")
+	eq(#subagents.running(subagents.extract(t.fixture("omp-subagents-nested-done"))), 0, "all done: nothing (stale nested pending dropped)")
+	eq(#subagents.running(subagents.extract(t.fixture("omp-subagents-running"))), 2, "running fixture keeps both")
+	eq(#subagents.running(subagents.extract(t.fixture("omp-subagent-pending"))), 1, "pending kept")
+end)
+
+test("tool: the agent's own running tool", function()
+	eq(subagents.tool(t.fixture("omp-subagents-running")), "task: Spawning Alpha and Beta subagents", "running task tool, not the subagents' tools")
+	eq(subagents.tool(t.fixture("omp-subagents-nested-done")), nil, "nothing running")
+	eq(subagents.tool(nil), nil, "nil")
+	eq(subagents.tool({ k = "col", c = { { k = "tool", p = { status = "running", name = "bash" } } } }), "bash", "no intent")
+	eq(subagents.tool({ k = "agent", c = { { k = "tool", p = { status = "running", name = "bash" } } } }), nil, "inside a subagent: not the agent's")
+end)
+
 t.finish("subagents")

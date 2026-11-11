@@ -35,6 +35,8 @@ export type Subagent = {
 	tool: string?,
 	-- That tool's intent line, when omp sends one.
 	intent: string?,
+	-- os.time() the window first saw it (set by window.luau, not by `extract`).
+	first_seen: number?,
 }
 
 local function num(v: any): number?
@@ -136,6 +138,78 @@ function subagents.counts(list: { Subagent }): { [string]: number }
 		counts[s.status] = (counts[s.status] or 0) + 1
 	end
 	return counts
+end
+
+local LIVE: { [string]: boolean } = { running = true, pending = true }
+
+-- The subagents the sidebar lists, as Orca does: running and pending ones, and a settled one only while it
+-- owns a running descendant. A pending one under a settled owner is dropped (omp leaves nested rows
+-- "pending" after their owner finished). Document order is kept, so owners come before what they own.
+function subagents.running(list: { Subagent }): { Subagent }
+	local keep: { boolean } = {}
+	-- Indices of the current entry's owners, nearest last.
+	local owners: { number } = {}
+	for i, s in list do
+		while #owners > 0 and list[owners[#owners]].depth >= s.depth do
+			table.remove(owners)
+		end
+		local settled_owner = false
+		for _, o in owners do
+			if not LIVE[list[o].status] then
+				settled_owner = true
+			end
+		end
+		if s.status == "running" then
+			keep[i] = true
+			for _, o in owners do
+				keep[o] = true
+			end
+		elseif s.status == "pending" and not settled_owner then
+			keep[i] = true
+		end
+		table.insert(owners, i)
+	end
+	local out: { Subagent } = {}
+	for i, s in list do
+		if keep[i] then
+			table.insert(out, s)
+		end
+	end
+	return out
+end
+
+local function last_running_tool(node: any): any
+	if type(node) ~= "table" or node.k == "agent" then
+		return nil
+	end
+	local found = nil
+	if node.k == "tool" and type(node.p) == "table" and node.p.status == "running" then
+		found = node
+	end
+	if type(node.c) == "table" then
+		for _, child in node.c do
+			found = last_running_tool(child) or found
+		end
+	end
+	return found
+end
+
+-- The agent's own running tool as "name: intent" (the last running tool node outside subagent nodes), nil
+-- when none runs. Never raises.
+function subagents.tool(tree: any): string?
+	if type(tree) ~= "table" then
+		return nil
+	end
+	local node = if tree.k ~= nil then last_running_tool(tree) else last_running_tool(tree.main)
+	if node == nil then
+		return nil
+	end
+	local name = text(node.p.name) or text(node.p.title)
+	if name == nil then
+		return nil
+	end
+	local intent = text(node.p.intent)
+	return if intent then name .. ": " .. intent else name
 end
 
 return subagents
