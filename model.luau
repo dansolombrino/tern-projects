@@ -305,4 +305,75 @@ function model.remove_project(state: State, id: string): boolean
 	return false
 end
 
+-- Sidebar UI state, stored per user (every window shares it) under `projects.ui.v1`.
+model.UI_KEY = "projects.ui.v1"
+
+export type Ui = {
+	-- The sidebar shows.
+	visible: boolean,
+	-- Its width in terminal cells; nil until fitted or dragged (then the default width applies).
+	want_cols: number?,
+	-- Project id → its group is collapsed.
+	collapsed: { [string]: boolean },
+}
+
+function model.empty_ui(): Ui
+	return { visible = false, collapsed = {} }
+end
+
+-- Repairs a decoded value into a Ui (unknown shapes become the defaults).
+function model.normalize_ui(raw: any): Ui
+	local ui = model.empty_ui()
+	if type(raw) ~= "table" then
+		return ui
+	end
+	ui.visible = raw.visible == true
+	if type(raw.want_cols) == "number" and raw.want_cols > 0 then
+		ui.want_cols = math.floor(raw.want_cols + 0.5)
+	end
+	if type(raw.collapsed) == "table" then
+		for id, v in raw.collapsed do
+			if type(id) == "string" and v == true then
+				ui.collapsed[id] = true
+			end
+		end
+	end
+	return ui
+end
+
+function model.load_ui(): Ui
+	local ok, raw = pcall(tern.kv.get, model.UI_KEY)
+	if not ok then
+		tern.log.warn("projects: kv read failed", raw)
+		return model.empty_ui()
+	end
+	return model.normalize_ui(raw)
+end
+
+function model.save_ui(ui: Ui)
+	tern.kv.set(model.UI_KEY, { visible = ui.visible, want_cols = ui.want_cols, collapsed = ui.collapsed })
+end
+
+-- Collapses every group in `ids`, or expands them all when all already are.
+function model.collapse_all(ui: Ui, ids: { string })
+	local all = #ids > 0
+	for _, id in ids do
+		if not ui.collapsed[id] then
+			all = false
+		end
+	end
+	for _, id in ids do
+		ui.collapsed[id] = if all then nil else true
+	end
+end
+
+-- A terminal cell's width in em of the font size, as a split's share measures it in Tern 0.9.16 (13px font:
+-- 36 cells made a 313px pane, its gutter included).
+model.CELL_EM = 0.67
+
+-- Width in cells of `px` pixels for a monospace font of `font_size` px.
+function model.cols_for_px(px: number, font_size: number): number
+	return math.max(1, math.floor(px / (font_size * model.CELL_EM) + 0.5))
+end
+
 return model

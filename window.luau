@@ -1,19 +1,26 @@
 --!strict
 -- projects, window half: projects (one named Tern session each), omp agents per
 -- project (each in a git worktree of its own when the project allows), spawned
--- and omp-internal subagents per agent, a dashboard canvas, a status segment and
--- toasts. Everything lives here; model.luau holds the data, subagents.luau and
--- dashboard.luau the pure surface reading and drawing.
+-- and omp-internal subagents per agent, an Orca-style left sidebar (a canvas
+-- docked at the left of the current tab, shown and hidden from the title bar),
+-- a status segment and toasts. Everything lives here; model.luau holds the data,
+-- subagents.luau and sidebar.luau the pure surface reading and drawing.
 
 local model = require("./model")
 local subagents = require("./subagents")
-local dashboard = require("./dashboard")
+local sidebar = require("./sidebar")
 
 local ID = tern.plugin.id
 local HOME = tern.getenv("HOME")
-local DASH_TITLE = "Projects"
-local MOD = if tern.runtime.os == "macos" then "cmd+alt+shift+" else "ctrl+alt+shift+"
--- Dashboard refresh period while it is open, and how often idle agents' surfaces are re-read.
+local MACOS = tern.runtime.os == "macos"
+local SIDE_TITLE = "Projects"
+local TOGGLE = "plugin." .. ID .. ".toggle_sidebar"
+local MOD = if MACOS then "cmd+alt+shift+" else "ctrl+alt+shift+"
+-- Orca's sidebar shortcut (Mod+B), bound only on request: Tern's presets use it.
+local ORCA_CHORD = if MACOS then "cmd+b" else "ctrl+b"
+-- Orca's default sidebar width and its drag limits, in pixels.
+local SIDE_PX, MIN_PX, MAX_PX = 280, 220, 500
+-- Sidebar refresh period while it shows, and how often idle agents' surfaces are re-read.
 local TICK_MS = 2000
 local IDLE_READ_MS = 10000
 -- Surface nodes read per agent for its omp-internal subagents.
@@ -37,14 +44,17 @@ type AgentRow = {
 	last_message: string?,
 	cwd: string,
 	branch: string?,
+	primary: boolean?,
+	started: number?,
 	spawned: { AgentRow },
 	internal: { subagents.Subagent },
 }
 
 type Counts = { working: number, waiting: number }
 
--- In-memory caches. `state` is re-read from kv before every change (other windows share it).
+-- In-memory caches. `state` and `ui` are re-read from kv before every change (other windows share them).
 local state: model.State = model.load()
+local ui: model.Ui = model.load_ui()
 -- Agent blocks by pane, from the last `cx.agents:list()`.
 local blocks: { [number]: AgentBlock } = {}
 -- omp-internal subagents by parent pane, and when each was last read (tern.now()).
@@ -53,10 +63,16 @@ local internal_at: { [number]: number } = {}
 -- Status-line inputs: agent counts per project id and each agent pane's project id.
 local counts: { [string]: Counts } = {}
 local pane_project: { [number]: string } = {}
--- The dashboard canvas and the generation of its refresh timer.
-local dash_pane: number? = nil
-local dash_gen = 0
+-- Agents that finished or asked for input while not focused, until focused.
+local unread: { [number]: boolean } = {}
+-- The last focused pane other than the sidebar.
+local last_main: number? = nil
+-- The sidebar canvas, the generation of its refresh timer and a pending coalesced redraw.
+local side_pane: number? = nil
+local side_gen = 0
 local refresh_pending = false
+-- The sidebar's split width in cells at the last settled fit: the share a fresh fit starts from.
+local fit_total: number? = nil
 -- The last answer each spawned subagent reported, and reports waiting for their busy parent.
 local reported: { [number]: string } = {}
 local pending: { [number]: { string } } = {}
@@ -159,6 +175,16 @@ local function scan(cx: WindowCx)
 			internal_at[pane] = nil
 		end
 	end
+	-- Intra-tab clicks send no `focus` event: the focused agent counts as read here too.
+	for pane in unread do
+		if blocks[pane] == nil then
+			unread[pane] = nil
+		end
+	end
+	local focused = cx.session:focused()
+	if focused then
+		unread[focused] = nil
+	end
 	counts, pane_project = new_counts, new_panes
 	tern.chrome.refresh()
 end
@@ -209,6 +235,8 @@ local function goto_pane(cx: WindowCx, pane: number)
 		cx.sessions:switch(s.id)
 	end
 	cx.layout:focus(pane)
+	last_main = pane
+	unread[pane] = nil
 end
 
 local function session_named(cx: WindowCx, name: string): ManagedSession?
@@ -233,20 +261,237 @@ local function ensure_session(cx: WindowCx, project: model.Project): boolean
 	return true
 end
 
--- Dashboard ------------------------------------------------------------------
+-- Sidebar ----------------------------------------------------------------------
 
-local function find_dash(cx: WindowCx): number?
-	if dash_pane and cx.canvas:get(dash_pane) then
-		return dash_pane
+local function find_side(cx: WindowCx): number?
+	-- A canvas just opened can be missing from the canvas replica for a moment; its pane is already there.
+	if side_pane and (cx.canvas:get(side_pane) or cx.session:pane(side_pane)) then
+		return side_pane
 	end
-	dash_pane = nil
+	side_pane = nil
 	for _, c in cx.canvas:list() do
-		if c.owner == ID and c.title == DASH_TITLE then
-			dash_pane = c.pane
+		if c.owner == ID and c.title == SIDE_TITLE then
+			side_pane = c.pane
 			return c.pane
 		end
 	end
 	return nil
+end
+
+local function parked(cx: WindowCx, pane: number): boolean
+	local info = cx.session:pane(pane)
+	return info ~= nil and info.parked == true
+end
+
+-- The sidebar when it shows in the current tab.
+local function shown_side(cx: WindowCx): number?
+	local side = find_side(cx)
+	if side == nil or parked(cx, side) then
+		return nil
+	end
+	local focused = cx.session:focused()
+	local here = if focused then cx.session:tab_of(focused) else nil
+	if here ~= nil and cx.session:tab_of(side) ~= here then
+		return nil
+	end
+	return side
+end
+
+-- The first leaf of `tree` other than `except`, left (and top) first.
+local function leftmost(tree: TabTree?, except: number?): number?
+	if tree == nil then
+		return nil
+	end
+	if tree.pane then
+		return if tree.pane == except then nil else tree.pane
+	end
+	return leftmost(tree[1], except) or leftmost(tree[2], except)
+end
+
+-- The split holding leaf `pane` and which side of it the leaf is.
+local function split_of(tree: TabTree?, pane: number): (TabTree?, number?)
+	if tree == nil or tree.pane then
+		return nil, nil
+	end
+	for i = 1, 2 do
+		local child = tree[i]
+		if child and child.pane == pane then
+			return tree, i
+		end
+		local s, side = split_of(child, pane)
+		if s then
+			return s, side
+		end
+	end
+	return nil, nil
+end
+
+local function tab_root(cx: WindowCx, tab: number?): TabTree?
+	if tab == nil then
+		return nil
+	end
+	local layout = cx.session:layout(tab)
+	return if layout then layout.root else nil
+end
+
+-- The sidebar's share of its split (nil unless it is the left side of a left/right split).
+local function side_ratio(cx: WindowCx, side: number): number?
+	local split, i = split_of(tab_root(cx, cx.session:tab_of(side)), side)
+	if split == nil or split.split ~= "right" or i ~= 1 then
+		return nil
+	end
+	return split.ratio or 0.5
+end
+
+-- The pane the user works in: the focused one, else the last one focused, never the sidebar.
+local function main_pane(cx: WindowCx, side: number?): number?
+	local focused = cx.session:focused()
+	if focused and focused ~= side then
+		return focused
+	end
+	if last_main and cx.session:pane(last_main) then
+		return last_main
+	end
+	if side then
+		return leftmost(tab_root(cx, cx.session:tab_of(side)), side)
+	end
+	return nil
+end
+
+local function default_cols(cx: WindowCx): number
+	local ok, size = pcall(function()
+		return cx.settings:get("terminal.font_size")
+	end)
+	return model.cols_for_px(SIDE_PX, if ok and type(size) == "number" then size else 13)
+end
+
+local function clamp_cols(cx: WindowCx, cols: number): number
+	local ok, size = pcall(function()
+		return cx.settings:get("terminal.font_size")
+	end)
+	local fs = if ok and type(size) == "number" then size else 13
+	return math.clamp(cols, model.cols_for_px(MIN_PX, fs), model.cols_for_px(MAX_PX, fs))
+end
+
+-- The layout's width of the sidebar's split in cells, measured by growing the sidebar a few cells and
+-- reading its share change; with the share after the probe and before it.
+local function measure(cx: WindowCx, side: number): (number?, number?, number?)
+	local r = side_ratio(cx, side)
+	if r == nil then
+		return nil, nil, nil
+	end
+	local probe = if r < 0.5 then 4 else -4
+	if not cx.layout:resize(side, "right", probe) then
+		return nil, nil, nil
+	end
+	local r2 = side_ratio(cx, side) :: number
+	if math.abs(r2 - r) < 1e-4 then
+		return nil, nil, nil
+	end
+	return r2, probe / (r2 - r), r
+end
+
+-- Brings the sidebar's share from `r` to `target` in a split `total` cells wide. Resizes take fractions of
+-- a cell, so a split the layout still thinks narrow (just unparked or moved) gets the share exactly too.
+local function resize_to(cx: WindowCx, side: number, r: number, total: number, target: number)
+	for _ = 1, 2 do
+		local d = (target - r) * total
+		if math.abs(d) < 0.25 or not cx.layout:resize(side, "right", d) then
+			break
+		end
+		r = side_ratio(cx, side) or r
+	end
+end
+
+-- Sizes the sidebar to the remembered width in cells. A pane that just opened, unparked or moved still has
+-- its old size in the layout, so this sets the share the last settled fit found right for the width, and
+-- `fit_settled` corrects it once the layout has the real size.
+local function fit(cx: WindowCx, side: number)
+	local r, total = measure(cx, side)
+	if r == nil or total == nil then
+		return
+	end
+	local want = ui.want_cols or default_cols(cx)
+	local target = if fit_total then want / (fit_total :: number) else 0.2
+	resize_to(cx, side, r, total, math.clamp(target, 0.05, 0.6))
+end
+
+local function fit_settled(cx: WindowCx, side: number)
+	local r, total = measure(cx, side)
+	if r == nil or total == nil then
+		return
+	end
+	local want = ui.want_cols or default_cols(cx)
+	resize_to(cx, side, r, total, want / total)
+	fit_total = total
+end
+
+-- Runs `fit_settled` after the next layout pass.
+local function fit_later(side: number)
+	tern.timer(80, function(tcx)
+		if tcx and side == side_pane and not parked(tcx, side) then
+			fit_settled(tcx, side)
+		end
+	end)
+end
+
+-- Keeps a width the user dragged the sidebar to (any width off the fitted one by more than a cell and a half),
+-- once a fit has settled (an unsettled width is the layout's, not the user's). Undoes the measuring probe.
+local function remember_width(cx: WindowCx, side: number)
+	if fit_total == nil then
+		return
+	end
+	local r2, total, r = measure(cx, side)
+	if r2 == nil or total == nil or r == nil then
+		return
+	end
+	resize_to(cx, side, r2, total, r)
+	local cols = r * total
+	ui = model.load_ui()
+	if math.abs(cols - (ui.want_cols or default_cols(cx))) <= 1.5 then
+		return
+	end
+	ui.want_cols = clamp_cols(cx, math.floor(cols + 0.5))
+	model.save_ui(ui)
+end
+
+-- Docks the sidebar at the left of the tab the user works in, then fits its width; false when Tern refused to
+-- unpark or move it (the caller then closes it and opens a new one).
+local function place(cx: WindowCx, side: number): boolean
+	local main = main_pane(cx, side)
+	local tab = if main then cx.session:tab_of(main) else nil
+	local moved = false
+	if parked(cx, side) then
+		local ok, err = cx.layout:unpark(side, { focus = false })
+		if not ok then
+			tern.log.warn("projects: unpark failed", err)
+			return false
+		end
+		moved = true
+	else
+		remember_width(cx, side)
+	end
+	if tab and cx.session:tab_of(side) ~= tab then
+		local ok, err = cx.layout:move_to_tab(side, tab, { focus = false })
+		if not ok then
+			tern.log.warn("projects: move to tab failed", err)
+			return false
+		end
+		moved = true
+	end
+	local root = tab_root(cx, cx.session:tab_of(side))
+	if root and not (root.split == "right" and root[1] and root[1].pane == side) then
+		local leaf = leftmost(root, side)
+		if leaf then
+			cx.layout:move(side, leaf, "left", { focus = false })
+			moved = true
+		end
+	end
+	if moved then
+		fit(cx, side)
+		fit_later(side)
+	end
+	return true
 end
 
 -- Re-reads the omp-internal subagents of working agents (and of the rest every IDLE_READ_MS).
@@ -282,9 +527,14 @@ local function snapshot(cx: WindowCx): any
 	end
 	table.sort(panes)
 	local rows: { [number]: AgentRow } = {}
+	local waiting = 0
 	for _, pane in panes do
 		local b = blocks[pane]
 		local meta = meta_of(pane)
+		local p = project_of(pane, b.cwd)
+		if b.state == "waiting_input" then
+			waiting += 1
+		end
 		rows[pane] = {
 			pane = pane,
 			title = title_of(pane, b.cwd),
@@ -293,6 +543,8 @@ local function snapshot(cx: WindowCx): any
 			last_message = b.last_message,
 			cwd = b.cwd,
 			branch = if meta then meta.branch else nil,
+			primary = p ~= nil and b.cwd ~= "" and model.inside(b.cwd, p.root),
+			started = if meta and meta.started > 0 then meta.started else nil,
 			spawned = {},
 			internal = internal[pane] or {},
 		}
@@ -325,100 +577,158 @@ local function snapshot(cx: WindowCx): any
 			agents = by_project[p.id] or {},
 		})
 	end
-	return { projects = projects, unassigned = unassigned }
+	return {
+		projects = projects,
+		unassigned = unassigned,
+		collapsed = ui.collapsed,
+		active = main_pane(cx, side_pane),
+		unread = unread,
+		now = os.time(),
+		waiting = waiting,
+	}
 end
 
-local function draw(cx: WindowCx): (Node, Node?)
+local function draw(cx: WindowCx): (Node, Node)
 	read_internal(cx)
-	local out = dashboard.build(snapshot(cx))
+	local out = sidebar.build(snapshot(cx))
 	return out.view, out.dock
 end
 
-local function refresh_dashboard(cx: WindowCx)
-	local pane = find_dash(cx)
-	if pane == nil then
+local function refresh_side(cx: WindowCx)
+	local side = find_side(cx)
+	if side == nil or parked(cx, side) then
 		return
 	end
 	local view, dock = draw(cx)
-	local change: CanvasChange = { view = view }
-	if dock then
-		change.dock = dock
-	end
-	cx.canvas:set(pane, change)
+	cx.canvas:set(side, { view = view, dock = dock })
 end
 
--- Refreshes everything event-driven: a scan now (unless the caller just did one), a dashboard
+-- Refreshes everything event-driven: a scan now (unless the caller just did one), a sidebar
 -- redraw soon (coalesced).
 local function changed(cx: WindowCx, scanned: boolean?)
 	if not scanned then
 		scan(cx)
 	end
-	if dash_pane == nil or refresh_pending then
+	if side_pane == nil or refresh_pending then
 		return
 	end
 	refresh_pending = true
 	tern.timer(150, function(tcx)
 		refresh_pending = false
 		if tcx then
-			refresh_dashboard(tcx)
+			refresh_side(tcx)
 		end
 	end)
 end
 
 local function tick(gen: number)
 	tern.timer(TICK_MS, function(cx)
-		if gen ~= dash_gen or cx == nil then
+		if gen ~= side_gen or cx == nil then
 			return
 		end
-		if find_dash(cx) == nil then
+		local side = find_side(cx)
+		if side == nil or parked(cx, side) then
 			return
 		end
 		scan(cx)
-		refresh_dashboard(cx)
+		refresh_side(cx)
 		tick(gen)
 	end)
 end
 
 local function start_ticker()
-	dash_gen += 1
-	tick(dash_gen)
+	side_gen += 1
+	tick(side_gen)
 end
 
-local function toggle_dashboard(cx: WindowCx)
-	local open = find_dash(cx)
-	if open then
-		cx.layout:close(open)
-		dash_pane = nil
-		dash_gen += 1
-		return
+local function set_visible(visible: boolean)
+	ui = model.load_ui()
+	if ui.visible ~= visible then
+		ui.visible = visible
+		model.save_ui(ui)
 	end
+end
+
+-- Shows the sidebar at the left of the current tab, leaving focus where it is.
+local function show_side(cx: WindowCx)
+	set_visible(true)
 	scan(cx)
-	local view, dock = draw(cx)
-	local target = cx.session:focused()
-	local spec: CanvasSpec = {
-		title = DASH_TITLE,
-		about = dashboard.ABOUT,
-		view = view,
-		focus = false,
-	}
-	if dock then
-		spec.dock = dock
+	local main = main_pane(cx, side_pane)
+	local side = find_side(cx)
+	if side and not place(cx, side) then
+		cx.layout:close(side)
+		side_pane, side = nil, nil
 	end
-	if target then
-		spec.how = "beside"
-		spec.target = target
-		spec.dir = "left"
-		spec.ratio = 0.28
+	if side then
+		refresh_side(cx)
 	else
-		spec.how = "tab"
+		local view, dock = draw(cx)
+		local spec: CanvasSpec = { title = SIDE_TITLE, about = sidebar.ABOUT, view = view, dock = dock, focus = false }
+		local target = if main then leftmost(tab_root(cx, cx.session:tab_of(main)), nil) else nil
+		if target then
+			spec.how = "beside"
+			spec.target = target
+			spec.dir = "left"
+			spec.ratio = 0.2
+		else
+			spec.how = "tab"
+		end
+		local pane, err = cx.canvas:open(spec)
+		if pane == nil then
+			cx:toast("error", "Projects sidebar not opened", err)
+			return
+		end
+		side_pane = pane
+		fit(cx, pane)
+		fit_later(pane)
 	end
-	local pane, err = cx.canvas:open(spec)
-	if pane == nil then
-		cx:toast("error", "Projects dashboard not opened", err)
+	if main and cx.session:focused() ~= main then
+		cx.layout:focus(main)
+	end
+	start_ticker()
+end
+
+-- Hides the sidebar: parked, so it keeps its pane and comes back at once (closed if it can't park).
+local function hide_side(cx: WindowCx)
+	set_visible(false)
+	local side = find_side(cx)
+	if side == nil or parked(cx, side) then
 		return
 	end
-	dash_pane = pane
-	start_ticker()
+	local main = main_pane(cx, side)
+	remember_width(cx, side)
+	local ok, err = cx.layout:park(side)
+	if not ok then
+		tern.log.warn("projects: park failed, closing the sidebar", err)
+		cx.layout:close(side)
+		side_pane = nil
+	end
+	side_gen += 1
+	if main and cx.session:pane(main) and cx.session:focused() ~= main then
+		cx.layout:focus(main)
+	end
+end
+
+local function toggle_side(cx: WindowCx)
+	if shown_side(cx) then
+		hide_side(cx)
+	else
+		show_side(cx)
+	end
+end
+
+-- Gives focus back to the pane the user works in after a click in the sidebar focused it.
+local function refocus(cx: WindowCx, side: number)
+	if cx.session:focused() ~= side then
+		return
+	end
+	local main = last_main
+	if main == nil or cx.session:pane(main) == nil or cx.session:tab_of(main) ~= cx.session:tab_of(side) then
+		main = leftmost(tab_root(cx, cx.session:tab_of(side)), side)
+	end
+	if main then
+		cx.layout:focus(main)
+	end
 end
 
 -- Agents ---------------------------------------------------------------------
@@ -717,17 +1027,6 @@ local function add_project(cx: WindowCx)
 	end)
 end
 
-local function remove_project(cx: WindowCx)
-	pick_project(cx, "Project to remove (files are kept)", function(pcx, p)
-		state = model.load()
-		if model.remove_project(state, p.id) then
-			model.save(state)
-			pcx:toast("success", "Removed " .. p.name, "Its files, session and worktrees are untouched")
-			changed(pcx)
-		end
-	end)
-end
-
 local function open_project(cx: WindowCx, p: model.Project)
 	local created = ensure_session(cx, p)
 	if created then
@@ -867,7 +1166,250 @@ local function cleanup(cx: WindowCx)
 	end)
 end
 
+local function confirm_remove(cx: WindowCx, p: model.Project)
+	ask_pick(cx, {
+		items = {
+			{ label = "Remove " .. p.name, detail = "its files, session and worktrees stay", icon = "trash", confirm = true },
+			{ label = "Keep it", icon = "x", confirm = false },
+		},
+		placeholder = "Remove project " .. p.name .. "?",
+		icon = "trash",
+	}, function(choice, ccx)
+		if not (choice :: any).confirm then
+			return
+		end
+		state = model.load()
+		if model.remove_project(state, p.id) then
+			model.save(state)
+			ui = model.load_ui()
+			if ui.collapsed[p.id] then
+				ui.collapsed[p.id] = nil
+				model.save_ui(ui)
+			end
+			ccx:toast("success", "Removed " .. p.name, "Its files, session and worktrees are untouched")
+			changed(ccx)
+		end
+	end)
+end
+
+local function remove_project(cx: WindowCx)
+	pick_project(cx, "Project to remove (files are kept)", confirm_remove)
+end
+
+local function rename_agent(cx: WindowCx, pane: number)
+	scan(cx)
+	local b = blocks[pane]
+	local cwd = if b then b.cwd else nil
+	ask_text(cx, { value = title_of(pane, cwd), placeholder = "New name for the agent", icon = "agent", action = "rename" }, function(text, rcx)
+		state = model.load()
+		local key = tostring(pane)
+		local meta = state.agents[key]
+		if meta then
+			meta.title = text
+		else
+			-- An agent started by hand: keep its name under the project its folder belongs to (if any).
+			local p = model.project_for_path(state, cwd)
+			state.agents[key] = { project = if p then p.id else "", title = text, started = 0 }
+		end
+		model.save(state)
+		local top = meta == nil or meta.parent == nil
+		local tab = rcx.session:tab_of(pane)
+		if top and tab then
+			rcx.layout:name_tab(tab, text)
+		end
+		changed(rcx)
+	end)
+end
+
+local function toggle_group(cx: WindowCx, id: string)
+	ui = model.load_ui()
+	ui.collapsed[id] = if ui.collapsed[id] then nil else true
+	model.save_ui(ui)
+	refresh_side(cx)
+end
+
+local function collapse_all(cx: WindowCx)
+	state = model.load()
+	ui = model.load_ui()
+	local ids: { string } = {}
+	for _, p in state.projects do
+		table.insert(ids, p.id)
+	end
+	model.collapse_all(ui, ids)
+	model.save_ui(ui)
+	refresh_side(cx)
+end
+
+-- Orca's switcher: every agent (subagents included) and every project, filtered as you type.
+local function search(cx: WindowCx)
+	scan(cx)
+	local snap = snapshot(cx)
+	local items: { PickItem } = {}
+	local function add_rows(rows: { AgentRow }, pname: string?, depth: number)
+		for _, row in rows do
+			local where = row.branch or (if row.cwd ~= "" then model.basename(row.cwd) else nil)
+			local detail = { pname, where, (string.gsub(row.state, "_", " ")) }
+			local parts: { string } = {}
+			for i = 1, 3 do
+				if detail[i] then
+					table.insert(parts, detail[i] :: string)
+				end
+			end
+			table.insert(items, {
+				label = string.rep("  ", depth) .. row.title,
+				detail = table.concat(parts, " · "),
+				group = "Agents",
+				icon = if row.state == "waiting_input" then "bell" else "agent",
+				current = row.pane == snap.active,
+				pane = row.pane,
+			})
+			add_rows(row.spawned, pname, depth + 1)
+		end
+	end
+	for _, ps in snap.projects do
+		add_rows(ps.agents, ps.project.name, 0)
+	end
+	add_rows(snap.unassigned, nil, 0)
+	for _, ps in snap.projects do
+		table.insert(items, {
+			label = ps.project.name,
+			detail = tilde(ps.project.root),
+			group = "Projects",
+			icon = "folder",
+			current = ps.current,
+			project = ps.project.id,
+		})
+	end
+	if #items == 0 then
+		cx:toast("info", "No agents or projects yet", "Add a project with Projects: Add project")
+		return
+	end
+	ask_pick(cx, { items = items, placeholder = "Jump to an agent or project", icon = "search", action = "go" }, function(item, pcx)
+		local it = item :: any
+		if it.pane then
+			goto_pane(pcx, it.pane)
+		elseif it.project then
+			local p = model.get(model.load(), it.project)
+			if p then
+				open_project(pcx, p)
+			end
+		end
+	end)
+end
+
+-- Whether ⌘B (Ctrl+B) runs the sidebar toggle by the user's keybind override.
+local function orca_chord_bound(cx: WindowCx): boolean
+	local ok, binds = pcall(function()
+		return cx.settings:keybinds()
+	end)
+	if not ok then
+		return false
+	end
+	local v = binds[ORCA_CHORD]
+	if type(v) == "table" then
+		return table.find(v, TOGGLE) ~= nil
+	end
+	return v == TOGGLE
+end
+
+-- Set below: registers the palette commands (again).
+local register_commands: () -> ()
+
+-- A keybinds change rebuilds the keymap without plugin command chords (Tern 0.9.16); registering the
+-- commands again brings them back.
+local function use_orca_chord(cx: WindowCx)
+	cx.settings:bind(ORCA_CHORD, TOGGLE)
+	register_commands()
+	cx:toast("success", (if MACOS then "⌘B" else "Ctrl+B") .. " now toggles the sidebar", "Projects: Release ⌘B gives it back to Tern")
+end
+
+-- Drops only our override, so the chord goes back to Tern's presets.
+local function release_orca_chord(cx: WindowCx)
+	local binds = cx.settings:keybinds()
+	binds[ORCA_CHORD] = nil
+	cx.settings:set("keybinds", binds)
+	register_commands()
+	cx:toast("info", (if MACOS then "⌘B" else "Ctrl+B") .. " is Tern's again")
+end
+
+local function options(cx: WindowCx)
+	local bound = orca_chord_bound(cx)
+	local chord = if MACOS then "⌘B" else "Ctrl+B"
+	local items: { PickItem } = {
+		{ label = "Add project", icon = "folder-plus", run = "add" },
+		{ label = "Remove project", detail = "keeps its files", icon = "trash", run = "remove" },
+		{ label = "Clean up worktrees", detail = "of finished agents", icon = "worktree", run = "cleanup" },
+		{ label = "Collapse or expand all projects", icon = "list", run = "collapse_all" },
+		{
+			label = if bound then "Stop using " .. chord .. " for the sidebar" else "Use " .. chord .. " for the sidebar",
+			detail = if bound then "back to Tern's " .. chord else "like Orca; replaces Tern's " .. chord,
+			icon = "settings",
+			run = if bound then "release" else "use",
+		},
+		{ label = "Show/hide Files", detail = "Tern's Files pane", icon = "folder", run = "files" },
+		{ label = "Refresh", icon = "refresh", run = "refresh" },
+		{ label = "Hide sidebar", icon = "sidebar", run = "hide" },
+	}
+	ask_pick(cx, { items = items, placeholder = "Projects sidebar", icon = "settings", action = "run" }, function(item, pcx)
+		local run = (item :: any).run
+		if run == "add" then
+			add_project(pcx)
+		elseif run == "remove" then
+			remove_project(pcx)
+		elseif run == "cleanup" then
+			cleanup(pcx)
+		elseif run == "collapse_all" then
+			collapse_all(pcx)
+		elseif run == "use" then
+			use_orca_chord(pcx)
+		elseif run == "release" then
+			release_orca_chord(pcx)
+		elseif run == "files" then
+			-- The built-in, past our override of `files`.
+			pcx:command("files")
+		elseif run == "refresh" then
+			changed(pcx)
+		elseif run == "hide" then
+			hide_side(pcx)
+		end
+	end)
+end
+
+-- A group header's … button: its right-click menu as a picker.
+local function project_menu(cx: WindowCx, p: model.Project)
+	ask_pick(cx, {
+		items = {
+			{ label = "New agent", detail = "in " .. p.name, icon = "plus", run = "new" },
+			{ label = "Open session", detail = p.name, icon = "folder-open", run = "open" },
+			{ label = "Remove project", detail = "keeps its files", icon = "trash", run = "remove" },
+		},
+		placeholder = p.name,
+		icon = "folder",
+		action = "run",
+	}, function(item, pcx)
+		local run = (item :: any).run
+		if run == "new" then
+			new_agent_in(pcx, p)
+		elseif run == "open" then
+			open_project(pcx, p)
+		elseif run == "remove" then
+			confirm_remove(pcx, p)
+		end
+	end)
+end
+
+local function new_agent_for(cx: WindowCx, id: string?)
+	local p = if id then model.get(model.load(), id) else nil
+	if p then
+		new_agent_in(cx, p)
+	else
+		new_agent(cx)
+	end
+end
+
 local COMMANDS: { CommandDef } = {
+	{ id = "toggle_sidebar", title = "Toggle sidebar", icon = "sidebar", keys = { if MACOS then "alt+cmd+b" else "ctrl+alt+b" }, run = toggle_side },
+	{ id = "search", title = "Search agents and projects", icon = "search", keys = { MOD .. "k" }, run = search },
 	{ id = "add", title = "Add project", icon = "folder-plus", run = add_project },
 	{ id = "remove", title = "Remove project (keeps files)", icon = "trash", run = remove_project },
 	{
@@ -894,15 +1436,41 @@ local COMMANDS: { CommandDef } = {
 			new_subagent_of(cx, pane)
 		end,
 	},
-	{ id = "dashboard", title = "Toggle projects dashboard", icon = "sidebar", keys = { MOD .. "d" }, run = toggle_dashboard },
 	{ id = "next_waiting", title = "Jump to next agent waiting for input", icon = "bell", keys = { MOD .. "j" }, run = next_waiting },
 	{ id = "cleanup", title = "Remove a finished agent's worktree", icon = "trash", run = cleanup },
+	{ id = "options", title = "Sidebar options", icon = "settings", run = options },
+	{
+		id = "use_cmd_b",
+		title = if MACOS then "Use ⌘B to toggle the sidebar" else "Use Ctrl+B to toggle the sidebar",
+		icon = "sidebar",
+		available = function(cx)
+			return not orca_chord_bound(cx)
+		end,
+		run = use_orca_chord,
+	},
+	{
+		id = "release_cmd_b",
+		title = if MACOS then "Release ⌘B (back to Tern's)" else "Release Ctrl+B (back to Tern's)",
+		icon = "sidebar",
+		available = orca_chord_bound,
+		run = release_orca_chord,
+	},
 }
 
-for _, def in COMMANDS do
-	def.group = "Projects"
-	tern.command(def)
+function register_commands()
+	for _, def in COMMANDS do
+		def.group = "Projects"
+		tern.command(def)
+	end
 end
+register_commands()
+
+-- The title bar's Files button (moved to the leading edge by chrome.css) and ⌃⌘E toggle the sidebar.
+-- Files stays on ⇧⌘E (focus_files) and the sidebar options.
+tern.override("files", function(cx: WindowCx): boolean?
+	toggle_side(cx)
+	return true
+end)
 
 -- Events ---------------------------------------------------------------------
 
@@ -910,12 +1478,16 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	if ev.owner ~= ID then
 		return false
 	end
+	-- A click focused the sidebar: give focus back first (synchronously, so it never shows).
+	refocus(cx, ev.pane)
 	-- Real clicks arrive split at `=` (act, value); scripted events arrive whole: parse_action takes both.
-	local act, parsed = dashboard.parse_action(ev)
+	local act, parsed = sidebar.parse_action(ev)
 	local pane = if type(parsed) == "number" then parsed else nil
 	local value = if type(parsed) == "string" then parsed else nil
 	if act == "focus" and pane then
 		goto_pane(cx, pane)
+	elseif act == "rename" and pane then
+		rename_agent(cx, pane)
 	elseif act == "stop" and pane then
 		pcall(function()
 			cx.agents:stop(pane)
@@ -923,30 +1495,59 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		changed(cx)
 	elseif act == "new_subagent" and pane then
 		new_subagent_of(cx, pane)
-	elseif act == "new_agent" and value then
-		local p = model.get(model.load(), value)
-		if p then
-			new_agent_in(cx, p)
-		end
+	elseif act == "new_agent" then
+		new_agent_for(cx, value)
 	elseif act == "open_project" and value then
 		local p = model.get(model.load(), value)
 		if p then
 			open_project(cx, p)
 		end
+	elseif act == "remove_project" and value then
+		local p = model.get(model.load(), value)
+		if p then
+			confirm_remove(cx, p)
+		end
+	elseif act == "toggle_group" and value then
+		toggle_group(cx, value)
+	elseif act == "collapse_all" then
+		collapse_all(cx)
 	elseif act == "add_project" then
 		add_project(cx)
+	elseif act == "search" then
+		search(cx)
+	elseif act == "cleanup" then
+		cleanup(cx)
+	elseif act == "next_waiting" then
+		next_waiting(cx)
 	elseif act == "refresh" then
 		scan(cx)
-		refresh_dashboard(cx)
+		refresh_side(cx)
+	elseif act == "hide" then
+		hide_side(cx)
+	elseif act == "options" then
+		options(cx)
+	elseif act == "project_menu" and value then
+		local p = model.get(model.load(), value)
+		if p then
+			project_menu(cx, p)
+		end
 	else
 		return false
 	end
 	return true
 end)
 
+-- An agent the user isn't looking at that finished or needs input is unread until focused.
+local function mark_unread(cx: WindowCx, pane: number)
+	if main_pane(cx, side_pane) ~= pane then
+		unread[pane] = true
+	end
+end
+
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	scan(cx)
 	if ev.new == "waiting_input" and ev.old ~= "waiting_input" and cx.session:focused() ~= ev.pane then
+		mark_unread(cx, ev.pane)
 		local b = blocks[ev.pane]
 		local cwd = if b then b.cwd else nil
 		local p = project_of(ev.pane, cwd)
@@ -963,6 +1564,7 @@ end)
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	scan(cx)
 	if (ev.result == "done" or ev.result == "failed") and cx.session:focused() ~= ev.pane then
+		mark_unread(cx, ev.pane)
 		local b = blocks[ev.pane]
 		local cwd = if b then b.cwd else nil
 		local p = project_of(ev.pane, cwd)
@@ -980,12 +1582,30 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	changed(cx, true)
 end)
 
-tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
-	if ev.pane == dash_pane then
-		dash_pane = nil
-		dash_gen += 1
+-- Focus moved: the focused agent is read, and the sidebar follows the user to another tab or session.
+tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
+	local side = find_side(cx)
+	if ev.pane == side then
 		return
 	end
+	last_main = ev.pane
+	unread[ev.pane] = nil
+	if side and ui.visible and not parked(cx, side) and cx.session:tab_of(side) ~= ev.tab then
+		show_side(cx)
+	end
+	changed(cx, true)
+end)
+
+tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
+	if ev.pane == side_pane then
+		side_pane = nil
+		side_gen += 1
+		return
+	end
+	if ev.pane == last_main then
+		last_main = nil
+	end
+	unread[ev.pane] = nil
 	state = model.load()
 	local key = tostring(ev.pane)
 	local meta = state.agents[key]
@@ -1006,17 +1626,27 @@ tern.on("session_ended", function(_ev: SessionEndedEvent, cx: WindowCx)
 	changed(cx)
 end)
 
+-- Once per plugin run: at window_start, or (after a reload, which runs no window_start) on the first timer.
+local started = false
 local function init(cx: WindowCx)
+	if started then
+		return
+	end
+	started = true
+	ui = model.load_ui()
 	scan(cx)
-	if find_dash(cx) then
-		refresh_dashboard(cx)
+	local side = find_side(cx)
+	if ui.visible then
+		show_side(cx)
+	elseif side and not parked(cx, side) then
+		-- Shown by an earlier run that didn't persist it: keep it live.
+		refresh_side(cx)
 		start_ticker()
 	end
 end
 
 tern.on("window_start", init)
 
--- A reload doesn't run window_start again: pick up the open dashboard and agents now.
 tern.timer(0, function(cx)
 	if cx then
 		init(cx)
@@ -1024,10 +1654,9 @@ tern.timer(0, function(cx)
 end)
 
 -- Pure: reads only the caches `scan` fills, which calls tern.chrome.refresh() on change.
--- Always shows one segment, so the dashboard is one click away from any pane: the focused
+-- Always shows one segment, so the sidebar is one click away from any pane: the focused
 -- pane's project with its counts, else "Projects" with the waiting count across all projects.
 local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
-	local command = "plugin." .. ID .. ".dashboard"
 	local id = pane_project[pane.pane]
 	local p = if id then model.get(state, id) else model.project_for_path(state, pane.cwd)
 	if p == nil then
@@ -1038,9 +1667,9 @@ local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
 		return {
 			{
 				text = if waiting > 0 then string.format("Projects · %d waiting", waiting) else "Projects",
-				icon = "folder",
+				icon = "sidebar",
 				tone = if waiting > 0 then "warn" else nil,
-				command = command,
+				command = TOGGLE,
 			},
 		}
 	end
@@ -1048,20 +1677,11 @@ local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
 	return {
 		{
 			text = string.format("%s · %d working · %d waiting", p.name, c.working, c.waiting),
-			icon = "folder",
+			icon = "sidebar",
 			tone = if c.waiting > 0 then "warn" else nil,
-			command = command,
+			command = TOGGLE,
 		},
 	}
 end
 
 tern.chrome.status(status_segments)
-
-tern.files.button({
-	id = "dashboard",
-	title = "Toggle projects dashboard",
-	icon = "sidebar",
-	run = function(_files, cx)
-		toggle_dashboard(cx)
-	end,
-})

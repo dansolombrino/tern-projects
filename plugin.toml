@@ -1,7 +1,8 @@
 schema = 1
 id = "projects"
 name = "Projects & Agents"
-version = "0.1.0"
-description = "Multiple projects, multiple omp agents per project and subagents per agent, with worktrees and a dashboard."
+version = "0.2.0"
+description = "Multiple projects, multiple omp agents per project and subagents per agent, with worktrees and an Orca-style left sidebar."
 icon = "folder"
 window = "window.luau"
+styles = ["sidebar.css", "chrome.css"]
