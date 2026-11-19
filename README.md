@@ -131,9 +131,13 @@ settings runs Tern's own Files action. Uninstalling the plugin gives the button 
 ### Placement and width
 
 Hiding parks the sidebar's pane (kept out of the park pile by `chrome.css`); showing unparks it and
-docks it left of the tab's leftmost pane. It follows you to other tabs and sessions while shown, and
-reopens with the window when it was shown. Its width is Orca's 280 px by default, or the width you
-last dragged it to (220 to 500 px), and is kept through splits opening and closing beside it.
+docks it left of the tab's leftmost pane. It follows you to other tabs and sessions while shown. Its
+width is Orca's 280 px by default, or the width you last dragged it to (220 to 500 px), and is kept
+through splits opening and closing beside it.
+
+There is one sidebar canvas, ever: only the toggle opens one. A plugin load, reload or window relaunch
+takes up the sidebar that exists (shown again when it was shown) and opens none; any extra sidebar
+canvas it finds (left by an older version or another run) is closed, then and every 30 s while shown.
 
 It refreshes on agent, pane, focus and session events and on a 2 s tick while shown, within Tern's
 window budget (50 ms per callback, see *Budget*): each tick re-reads the agents and the host half's
