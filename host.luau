@@ -12,10 +12,14 @@
 local mailq = require("./mailq")
 local model = require("./model")
 local identity = require("./identity")
+local fleet = require("./fleet")
 
 local DATA = tern.plugin.data
 local SPOOL = DATA .. "/spool"
 local STATUS = DATA .. "/status.json"
+local FLEET = DATA .. "/fleet.json"
+-- The agent-fleet state root (fleet.luau), fixed for the daemon's environment.
+local FLEET_ROOT = fleet.state_root(tern.getenv)
 local HELPER = tern.plugin.dir .. "/mailbox.py"
 -- The CLI for `tern inspect`: the daemon's own executable when it says, else the app's, else PATH's.
 local TERN_CLI = tern.getenv("TERN_EXE")
@@ -44,6 +48,8 @@ end
 -- Live panes: id → cwd and omp session file (when it runs omp), from the last poll.
 type PaneSeen = { cwd: string, session_file: string?, agent: boolean }
 local panes: { [number]: PaneSeen } = {}
+-- Every pane (exited ones too) and session from the last poll, for the fleets (fleet.luau).
+local live: fleet.Live? = nil
 
 local function agents_now(): ({ mailq.Agent }, { [number]: string })
 	local agents: { mailq.Agent } = {}
@@ -296,9 +302,72 @@ local function poll_panes()
 			end
 		end
 		panes = fresh
+		live = fleet.live_of(doc)
 	end)
 	if not ok then
 		inspecting = false
+	end
+end
+
+-- Fleets: the agent-fleet states (tern_fleet.py writes them; this only reads) with live panes and the mailbox, written
+-- to `<data>/fleet.json` when the model changed; `fleet_sig` in status.json counts the changes, so a window re-reads
+-- the file only then.
+local fleet_cache: fleet.Cache = {}
+local fleet_json: string? = nil
+-- Unique per host run, so a window never mistakes a restarted count for the one it read.
+local FLEET_RUN = string.format("%d-%d", os.time(), math.random(1, 1000000))
+local fleet_sig = FLEET_RUN .. ".0"
+local fleet_n = 0
+
+local function mail_live(): { by_id: { [string]: string }, queued: { [number]: number } }
+	local by_id: { [string]: string } = {}
+	local queued: { [number]: number } = {}
+	local by_file: { [string]: number } = {}
+	for pane, p in panes do
+		if p.session_file then
+			by_file[p.session_file :: string] = pane
+		end
+	end
+	for _, m in box.msgs do
+		by_id[m.id] = m.state
+		if m.state == "queued" then
+			local pane = m.target.pane
+			if (pane == nil or panes[pane] == nil) and m.target.session_file then
+				pane = by_file[m.target.session_file :: string] or pane
+			end
+			if pane then
+				queued[pane] = (queued[pane] or 0) + 1
+			end
+		end
+	end
+	return { by_id = by_id, queued = queued }
+end
+
+local function scan_fleets()
+	if FLEET_ROOT == nil or live == nil then
+		return
+	end
+	local entries, cache = fleet.read_states(FLEET_ROOT :: string, {
+		list = tern.fs.list,
+		read = function(path: string): string?
+			return tern.fs.read(path, 4194304)
+		end,
+		decode = tern.json.decode,
+	}, fleet_cache)
+	fleet_cache = cache
+	local l = live :: fleet.Live
+	l.mail = mail_live()
+	local m = fleet.build(entries, l)
+	local text = tern.json.encode(m)
+	if text ~= fleet_json then
+		local ok, err = pcall(tern.fs.write, FLEET, text)
+		if ok then
+			fleet_json = text
+			fleet_n += 1
+			fleet_sig = FLEET_RUN .. "." .. fleet_n
+		else
+			tern.log.warn("projects: fleet.json not written", err)
+		end
 	end
 end
 
@@ -336,7 +405,7 @@ local function write_status()
 			queued += 1
 		end
 	end
-	local doc = { at = os.time(), panes = out_panes, repos = out_repos, queued = queued }
+	local doc = { at = os.time(), panes = out_panes, repos = out_repos, queued = queued, fleet_sig = fleet_sig }
 	pcall(tern.fs.write, STATUS, tern.json.encode(doc))
 end
 
@@ -359,6 +428,10 @@ end
 every(SPOOL_MS, "spool", apply_spool)
 every(PANES_MS, "status", function()
 	poll_panes()
+	local ok, err = pcall(scan_fleets)
+	if not ok then
+		tern.log.warn("projects: host fleet scan failed", err)
+	end
 	write_status()
 end)
 

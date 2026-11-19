@@ -229,6 +229,10 @@ local function snapshot(cx: WindowCx): any
 		if b.state == "waiting_input" then
 			waiting += 1
 		end
+		-- A fleet's coordinator and workers show in its section (fleets.luau), not as cards.
+		if S.fleet_claimed[pane] then
+			continue
+		end
 		local res = if b.state ~= "working" then S.results[pane] else nil
 		local branch, detached = nil, nil
 		if b.cwd ~= "" then
@@ -400,6 +404,7 @@ local function snapshot(cx: WindowCx): any
 			}
 		end)(),
 		waiting = waiting,
+		fleets = S.fleet_snap(S.main_pane(cx, S.side_pane)),
 	}
 end
 

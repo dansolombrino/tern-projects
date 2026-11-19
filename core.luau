@@ -274,6 +274,11 @@ local function read_status()
 	S.host_repos = if type(doc.repos) == "table" then doc.repos else {}
 	S.mail_queued = if type(doc.queued) == "number" then doc.queued else 0
 	S.status_at = if type(doc.at) == "number" then doc.at else 0
+	-- The fleet model is re-read only when the host wrote a new one.
+	if doc.fleet_sig ~= nil and doc.fleet_sig ~= S.fleet_sig and S.load_fleets then
+		S.fleet_sig = doc.fleet_sig
+		S.load_fleets()
+	end
 end
 
 -- The scan's first half, one native call: every agent block (`cx.agents:list()`), and whether any shown field of

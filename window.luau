@@ -28,6 +28,7 @@ require("./agents")(S)
 require("./projects")(S)
 require("./pickers")(S)
 require("./mail")(S)
+require("./fleets")(S)
 
 -- Commands --------------------------------------------------------------------------------
 
@@ -133,7 +134,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	local value = if type(parsed) == "string" then parsed else nil
 	local alt = ev.mods ~= nil and table.find(ev.mods, "alt") ~= nil
 	if pane then
-		if act == "focus" then
+		if act == "fleet_focus" then
+			S.fleet_focus(cx, pane)
+		elseif act == "focus" then
 			if pane < 0 then
 				S.wake(cx, pane)
 			else
@@ -171,7 +174,9 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 		return true
 	end
-	if act == "new_agent" then
+	if act == "fleet_group" and value then
+		S.fleet_group(cx, value)
+	elseif act == "new_agent" then
 		S.new_agent_for(cx, value)
 	elseif act == "toggle_group" and value then
 		if alt then
@@ -304,6 +309,7 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 		return
 	end
 	S.last_main = ev.pane
+	S.fleet_focused(ev.pane)
 	S.clear_unread(if S.card_pane(ev.pane) == ev.pane then S.unread_keys(ev.pane) else { core.key_of(ev.pane) })
 	-- (Parked while shown: it waited for a tab with a pane to work in.)
 	if side and S.ui.visible and (S.parked(cx, side) or cx.session:tab_of(side) ~= ev.tab) then

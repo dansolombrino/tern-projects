@@ -948,6 +948,8 @@ export type Ui = {
 	unread: { [string]: boolean },
 	-- Delete workspaces without the confirmation.
 	skip_delete_confirm: boolean,
+	-- Fleet key (fleet.luau) → os.time() its coordinator was last focused: a worker's report after it is unread.
+	fleet_seen: { [string]: number },
 }
 
 local CHOICES: { [string]: { string } } = {
@@ -972,6 +974,7 @@ function model.empty_ui(): Ui
 		pinned = {},
 		unread = {},
 		skip_delete_confirm = false,
+		fleet_seen = {},
 	}
 end
 
@@ -1017,6 +1020,13 @@ function model.normalize_ui(raw: any): Ui
 	ui.pinned = flags(raw.pinned)
 	ui.unread = flags(raw.unread)
 	ui.skip_delete_confirm = raw.skip_delete_confirm == true
+	if type(raw.fleet_seen) == "table" then
+		for k, v in raw.fleet_seen do
+			if type(k) == "string" and type(v) == "number" then
+				ui.fleet_seen[k] = v
+			end
+		end
+	end
 	return ui
 end
 
