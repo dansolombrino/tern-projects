@@ -8,11 +8,14 @@
 --   (and queue subagent report-backs) through files in `<data>/spool/`, which this half applies.
 -- - Polling: every pane's omp session file, and the branch of every folder an agent card shows (git runs here,
 --   not in a window), written to `<data>/status.json` for the window halves to read.
+-- - GitHub (ghpoll.luau): the PRs and issues of every project's repository and the PR of every branch a card shows,
+--   read with `gh` on a rate-limited clock and written to `<data>/gh.json`.
 
 local mailq = require("./mailq")
 local model = require("./model")
 local identity = require("./identity")
 local fleet = require("./fleet")
+local ghpoll = require("./ghpoll")
 
 local DATA = tern.plugin.data
 local SPOOL = DATA .. "/spool"
@@ -31,6 +34,8 @@ local PANES_MS = 2000
 local REPO_TTL = 15
 -- A spool file that still does not parse after this many looks is dropped.
 local SPOOL_TRIES = 10
+-- The GitHub clock (ghpoll.luau keeps each repository's own pace).
+local GH_MS = 5000
 
 pcall(tern.fs.mkdir, SPOOL)
 
@@ -166,6 +171,7 @@ end
 
 tern.on("unload", function()
 	unloading = true
+	ghpoll.stop()
 	if helper then
 		pcall(function()
 			(helper :: Child):kill()
@@ -203,6 +209,8 @@ local function apply_spool()
 					changed = changed or c
 				elseif obj.op == "ack" then
 					changed = mailq.apply(box, obj, now) or changed
+				else
+					ghpoll.spool(obj)
 				end
 				pcall(tern.fs.remove, path)
 				tries[name] = nil
@@ -321,6 +329,8 @@ local fleet_n = 0
 -- How long the last fleet scan took and the longest one this run (ms), reported in status.json.
 local fleet_ms = 0
 local fleet_ms_max = 0
+-- The last fleet model: its worktrees and branches get PR badges (ghpoll.luau).
+local fleet_model: fleet.Model? = nil
 
 local function mail_live(): { by_id: { [string]: string }, queued: { [number]: number } }
 	local by_id: { [string]: string } = {}
@@ -362,6 +372,7 @@ local function scan_fleets()
 	local l = live :: fleet.Live
 	l.mail = mail_live()
 	local m = fleet.build(entries, l)
+	fleet_model = m
 	fleet_ms = tern.now() - t0
 	fleet_ms_max = math.max(fleet_ms_max, fleet_ms)
 	if fleet_ms > 200 then
@@ -414,7 +425,7 @@ local function write_status()
 			queued += 1
 		end
 	end
-	local doc = {
+	local doc: { [string]: any } = {
 		at = os.time(),
 		panes = out_panes,
 		repos = out_repos,
@@ -423,6 +434,9 @@ local function write_status()
 		fleet_ms = math.floor(fleet_ms * 10 + 0.5) / 10,
 		fleet_ms_max = math.floor(fleet_ms_max * 10 + 0.5) / 10,
 	}
+	for k, v in ghpoll.stats() do
+		doc[k] = v
+	end
 	pcall(tern.fs.write, STATUS, tern.json.encode(doc))
 end
 
@@ -451,6 +465,43 @@ every(PANES_MS, "status", function()
 	end
 	write_status()
 end)
+
+-- GitHub: what the sidebar shows, as folders with the branch each card shows.
+ghpoll.start({
+	wants = function(): { ghpoll.Want }
+		local out: { ghpoll.Want } = {}
+		for _, p in model.load().projects do
+			table.insert(out, { dir = p.root })
+		end
+		for cwd, r in repos do
+			table.insert(out, { dir = cwd, branch = r.branch })
+		end
+		local m = fleet_model
+		if m then
+			for _, f in m.fleets do
+				for _, g in f.groups do
+					if g.worktree then
+						table.insert(out, { dir = g.worktree :: string, branch = g.branch })
+					end
+					for _, it in g.items do
+						if it.worktree then
+							table.insert(out, { dir = it.worktree :: string, branch = it.branch })
+						end
+					end
+				end
+			end
+		end
+		return out
+	end,
+	shown = function(): boolean
+		return model.load_ui().visible
+	end,
+	branch_of = function(cwd: string): string?
+		local r = repos[cwd]
+		return if r then r.branch else nil
+	end,
+})
+every(GH_MS, "github", ghpoll.tick)
 
 poll_panes()
 start_helper()

@@ -8,6 +8,7 @@
 -- Clicks carry `actions = {click = "<act>=<value>"}`; Tern splits the name at
 -- the first `=`, so `canvas_action` handlers get `ev.act` and `ev.value`.
 
+local gh = require("./gh")
 local subagents = require("./subagents")
 
 export type Subagent = subagents.Subagent & {
@@ -56,6 +57,9 @@ export type AgentRow = {
 	primary: boolean?,
 	pinned: boolean?,
 	deleting: boolean?,
+	-- The PR of its branch (gh.luau), and whether that data is stale (the last refresh failed or is old).
+	pr: gh.Pr?,
+	pr_stale: boolean?,
 	spawned: { AgentRow }?,
 	-- Running or pending only, flattened, owners before owned.
 	internal: { Subagent }?,
@@ -69,6 +73,22 @@ export type ProjectSnap = {
 	current: boolean,
 	agents: { AgentRow },
 	group: Group?,
+	-- Its GitHub repository's PRs and issues; nil outside GitHub.
+	gh: GhSnap?,
+}
+
+-- A project's "PRs & issues": its open PRs the user authored or is asked to review, open issues assigned to them.
+export type GhSnap = {
+	slug: string,
+	prs: { gh.Pr },
+	issues: { gh.Issue },
+	-- The last refresh failed (`error`) or is old; data from `ok_at` (os.time(), nil before the first).
+	stale: boolean,
+	error: string?,
+	ok_at: number?,
+	busy: boolean?,
+	-- The list is expanded.
+	open: boolean?,
 }
 
 export type Snapshot = {
@@ -119,6 +139,8 @@ export type FleetItemSnap = {
 	-- Mailbox state of its last message (queued, delivered, failed) and messages queued for it.
 	mailbox: string?,
 	queued: number?,
+	pr: gh.Pr?,
+	pr_stale: boolean?,
 	unread: boolean?,
 }
 
@@ -129,6 +151,8 @@ export type FleetGroupSnap = {
 	branch: string?,
 	session_live: boolean?,
 	creating: boolean?,
+	pr: gh.Pr?,
+	pr_stale: boolean?,
 	items: { FleetItemSnap },
 }
 
@@ -180,6 +204,12 @@ sidebar.ACT = {
 	fleet_group = "fleet_group",
 	-- value: a fleet card's pane
 	fleet_focus = "fleet_focus",
+	-- value: a https://github.com/ URL (opened in the system browser)
+	open_url = "open_url",
+	-- value: `owner/repo`: refresh its PRs and issues now
+	gh_refresh = "gh_refresh",
+	-- value: project id: expand or collapse its "PRs & issues"
+	toggle_prs = "toggle_prs",
 	-- no value
 	collapse_all = "collapse_all",
 	add_project = "add_project",
@@ -503,6 +533,146 @@ local function glyph(state: string, size: string, label: string?): any
 		inner = span("op-dot", nil, "dot")
 	end
 	return el("span", { class = cls, key = "st", title = label }, { inner })
+end
+
+-- Pull requests -----------------------------------------------------------------
+
+local CI_LABEL: { [string]: string } = { pass = "checks pass", fail = "checks fail", pending = "checks running" }
+local REVIEW_MARK: { [string]: string } = { approved = "✓", changes = "✗", review = "•" }
+local REVIEW_LABEL: { [string]: string } = { approved = "approved", changes = "changes requested", review = "review required" }
+
+-- A PR's tooltip: "PR #12 · open · checks pass 3/3 · approved", its title, and the click's effect.
+function sidebar.pr_title(pr: gh.Pr, stale: boolean?): string
+	local parts = { string.format("PR #%d · %s", pr.n, pr.state) }
+	if pr.ci then
+		table.insert(parts, CI_LABEL[pr.ci] .. (if pr.checks then " " .. pr.checks else ""))
+	end
+	if pr.review then
+		table.insert(parts, REVIEW_LABEL[pr.review])
+	end
+	if pr.conflicts then
+		table.insert(parts, "conflicts")
+	end
+	return table.concat(parts, " · ") .. "\n" .. pr.title .. (if stale then "\n(stale: GitHub not reached lately)" else "") .. "\nClick to open on GitHub"
+end
+
+-- The badge: number and state, a CI dot (pass, fail, pending) and the review mark. `click` nil: inert (its row
+-- carries the click).
+local function pr_badge(pr: gh.Pr, key: string, stale: boolean?, click: boolean): any
+	local kids: { any } = { span("op-pr-n", string.format("#%d %s", pr.n, pr.state), "n") }
+	if pr.ci then
+		table.insert(kids, span("op-ci op-ci-" .. pr.ci, nil, "ci"))
+	end
+	if pr.review then
+		table.insert(kids, span("op-rv op-rv-" .. pr.review, REVIEW_MARK[pr.review], "rv"))
+	end
+	if pr.conflicts then
+		table.insert(kids, span("op-pr-x", "!", "x"))
+	end
+	return el("span", {
+		key = key,
+		class = "op-pr op-pr-" .. pr.state .. (if stale then " op-stale" else ""),
+		title = sidebar.pr_title(pr, stale),
+		actions = if click then { click = act("open_url", pr.url) } else nil,
+	}, kids)
+end
+
+-- "2 PRs · 1 issue" for a project's header; nil when there is nothing to count and nothing is wrong.
+function sidebar.gh_counts(g: GhSnap): string?
+	local parts: { string } = {}
+	if #g.prs > 0 then
+		table.insert(parts, string.format("%d PR%s", #g.prs, if #g.prs == 1 then "" else "s"))
+	end
+	if #g.issues > 0 then
+		table.insert(parts, string.format("%d issue%s", #g.issues, if #g.issues == 1 then "" else "s"))
+	end
+	if g.stale and g.ok_at ~= nil then
+		table.insert(parts, "stale")
+	end
+	return if #parts > 0 then table.concat(parts, " · ") else nil
+end
+
+-- At most this many PRs and issues each are listed; the rest are a "N more" row to the repository's page.
+local GH_ROWS = 8
+
+-- A project's "PRs & issues": a header row (chevron, counts, stale marker, refresh, open in browser) and, expanded,
+-- one row per PR and issue.
+local function gh_section(snap: Snapshot, ps: ProjectSnap, g: GhSnap): any
+	local base = "https://github.com/" .. g.slug
+	local status: string
+	if g.busy then
+		status = "refreshing…"
+	elseif g.ok_at == nil then
+		status = if g.error then "unavailable" else "loading…"
+	elseif g.stale then
+		status = "stale · " .. (sidebar.ago(snap.now, g.ok_at) or "")
+	else
+		status = sidebar.ago(snap.now, g.ok_at) or ""
+	end
+	local tip = g.slug .. (if g.error then "\nLast refresh failed: " .. g.error else "")
+	local head_kids: { any } = {
+		el("span", { key = "chev", class = "op-chev" }, { icon("chev") }),
+		span("op-ghs-t", "PRs & issues", "t"),
+		span("op-ghs-n", string.format("%d · %d", #g.prs, #g.issues), "n"),
+		span("op-ghs-s" .. (if g.stale then " op-stale" else ""), status, "s"),
+		el("div", { key = "acts", class = "op-ghs-acts" }, {
+			el("button", { key = "refresh", class = "op-ib op-sm op-txt", title = "Refresh PRs and issues", actions = { click = act("gh_refresh", g.slug) } }, {
+				span("op-txt-g", "↻", "g"),
+			}),
+			el("button", { key = "web", class = "op-ib op-sm op-txt", title = "Open " .. g.slug .. " pull requests in the browser", actions = { click = act("open_url", base .. "/pulls") } }, {
+				span("op-txt-g", "↗", "g"),
+			}),
+		}),
+	}
+	local children: { any } = {
+		el("div", { key = "head", class = "op-ghs-head", title = tip, actions = { click = act("toggle_prs", ps.project.id) } }, head_kids),
+	}
+	if g.open then
+		local function more(key: string, n: number, what: string, url: string)
+			children[#children + 1] = el("div", { key = key, class = "op-ghrow op-ghmore", actions = { click = act("open_url", url) } }, {
+				span("op-ghrow-t", string.format("%d more %s on GitHub", n, what), "t"),
+			})
+		end
+		for i, pr in g.prs do
+			if i > GH_ROWS then
+				more("prmore", #g.prs - GH_ROWS, "PRs", base .. "/pulls")
+				break
+			end
+			-- Mine needs no word; a PR in the list only because a review is asked of the user says so.
+			local why = if pr.asked and not pr.mine then "review asked" else nil
+			local kids: { any } = { pr_badge(pr, "b", g.stale, false), span("op-ghrow-t", pr.title, "t") }
+			if why then
+				table.insert(kids, span("op-ghrow-m", why, "m"))
+			end
+			children[#children + 1] = el("div", {
+				key = string.format("pr%d", pr.n),
+				class = "op-ghrow",
+				title = sidebar.pr_title(pr, g.stale),
+				actions = { click = act("open_url", pr.url) },
+			}, kids)
+		end
+		for i, it in g.issues do
+			if i > GH_ROWS then
+				more("ismore", #g.issues - GH_ROWS, "issues", base .. "/issues?q=is%3Aissue+is%3Aopen+assignee%3A%40me")
+				break
+			end
+			children[#children + 1] = el("div", {
+				key = string.format("is%d", it.n),
+				class = "op-ghrow",
+				title = string.format("Issue #%d\n%s\nClick to open on GitHub", it.n, it.title),
+				actions = { click = act("open_url", it.url) },
+			}, {
+				span("op-pr op-issue", string.format("#%d", it.n), "b"),
+				span("op-ghrow-t", it.title, "t"),
+			})
+		end
+		if #g.prs == 0 and #g.issues == 0 then
+			children[#children + 1] = el("div", { key = "none", class = "op-ghrow op-ghnone" }, {
+				span("op-ghrow-t", if g.ok_at then "No open PRs or issues for you" else "Nothing yet", "t"),
+			})
+		end
+	end
+	return el("div", { key = "prs", class = "op-ghs" .. (if g.open then "" else " collapsed") }, children)
 end
 
 -- Menus ----------------------------------------------------------------------
@@ -829,8 +999,14 @@ local function card(ctx: Ctx, row: AgentRow): any
 	elseif snap.show_branch and row.branch ~= nil then
 		meta = span("op-meta-t", row.branch, "t")
 	end
+	if row.pr ~= nil then
+		local badge = pr_badge(row.pr :: gh.Pr, "pr", row.pr_stale, true)
+		meta = if meta ~= nil then { meta, badge } else { badge }
+	elseif meta ~= nil then
+		meta = { meta }
+	end
 	if meta ~= nil then
-		table.insert(stack, el("div", { key = "meta", class = "op-meta" }, { meta }))
+		table.insert(stack, el("div", { key = "meta", class = "op-meta" }, meta))
 	end
 
 	if snap.show_agents ~= false and not sleeping then
@@ -925,13 +1101,18 @@ local function project_section(snap: Snapshot, ps: ProjectSnap): any
 	local menu = project_menu(snap, ps)
 	local head = header(project_icon(p), p.name, {
 		toggle = act("toggle_group", p.id),
-		chevron = #ps.agents > 0,
+		chevron = #ps.agents > 0 or ps.gh ~= nil,
 		menu = menu,
 		more = act("project_menu", p.id),
 		more_title = "Project actions",
 		new = act("new_agent", p.id),
 		new_title = "New agent in " .. p.name,
 	})
+	local counts = if ps.gh then sidebar.gh_counts(ps.gh :: GhSnap) else nil
+	if counts ~= nil then
+		-- After the name, before the hover actions.
+		table.insert(head.c, 3, span("op-ghc" .. (if (ps.gh :: GhSnap).stale then " op-stale" else ""), counts, "ghc"))
+	end
 	local children: { any } = { head }
 	if not shut then
 		local ctx: Ctx = { snap = snap, project = p }
@@ -939,6 +1120,9 @@ local function project_section(snap: Snapshot, ps: ProjectSnap): any
 			if nodes_left > 60 then
 				children[#children + 1] = card(ctx, row)
 			end
+		end
+		if ps.gh ~= nil and nodes_left > 80 then
+			children[#children + 1] = gh_section(snap, ps, ps.gh :: GhSnap)
 		end
 	end
 	return el("div", {
@@ -1046,6 +1230,8 @@ local function fleet_card(snap: Snapshot, key: string, o: {
 	click: string,
 	extra: string,
 	menu: { any },
+	pr: gh.Pr?,
+	pr_stale: boolean?,
 }): any
 	local cls = "op-card op-fcard " .. o.extra
 	if o.pane ~= nil and snap.active == o.pane then
@@ -1070,6 +1256,9 @@ local function fleet_card(snap: Snapshot, key: string, o: {
 		table.insert(meta, span("op-fq", string.format("%d queued", o.queued), "q"))
 	elseif o.mailbox == "queued" or o.mailbox == "failed" then
 		table.insert(meta, span("op-fq", "mail " .. o.mailbox, "q"))
+	end
+	if o.pr ~= nil then
+		table.insert(meta, pr_badge(o.pr :: gh.Pr, "pr", o.pr_stale, true))
 	end
 	local stack: { any } = {
 		el("div", { key = "line", class = "op-line", title = o.title .. (if o.meta then "\n" .. o.meta else "") }, {
@@ -1137,6 +1326,10 @@ local function fleet_group(snap: Snapshot, f: FleetSnap, g: FleetGroupSnap): any
 			extra = "op-pghead op-fghead",
 		}),
 	}
+	if g.pr ~= nil then
+		-- After the name, before the hover actions.
+		table.insert(children[1].c, 3, pr_badge(g.pr :: gh.Pr, "pr", g.pr_stale, true))
+	end
 	if not shut then
 		for _, it in g.items do
 			if nodes_left > 60 then
@@ -1153,6 +1346,8 @@ local function fleet_group(snap: Snapshot, f: FleetSnap, g: FleetGroupSnap): any
 					click = click,
 					extra = "op-fworker",
 					menu = { { id = click, label = "Focus", icon = "terminal" }, menu[1] },
+					pr = it.pr,
+					pr_stale = it.pr_stale,
 				})
 			end
 		end

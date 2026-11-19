@@ -623,3 +623,98 @@ html[data-theme='dark'] .op-g-folder-tree { background-image: url("data:image/sv
 .op-fb-done, .op-fb-idle { color: var(--op-done); background: color-mix(in srgb, var(--op-done) 12%, transparent); }
 .op-fb-failed { color: var(--op-failed); background: color-mix(in srgb, var(--op-failed) 12%, transparent); }
 .op-fq { flex-shrink: 0; font-size: 10px; color: var(--op-question); }
+
+/* Pull requests (gh): a card's PR badge (number and state, CI dot, review mark), a project's header counts and its
+   collapsible "PRs & issues" list. State colors follow GitHub's: open green, draft gray, merged purple, closed red. */
+.op-pr {
+	--op-prc: var(--op-muted);
+	display: inline-flex;
+	align-items: center;
+	flex-shrink: 0;
+	gap: 4px;
+	height: 16px;
+	padding: 0 5px;
+	border: 1px solid color-mix(in srgb, var(--op-prc) 35%, transparent);
+	border-radius: 4px;
+	background: color-mix(in srgb, var(--op-prc) 10%, transparent);
+	color: var(--op-prc);
+	font-size: 10px;
+	font-weight: 500;
+	line-height: 1;
+	font-variant-numeric: tabular-nums;
+	cursor: pointer;
+}
+.op-pr:hover { background: color-mix(in srgb, var(--op-prc) 20%, transparent); }
+.op-pr-open { --op-prc: light-dark(#1a7f37, #3fb950); }
+.op-pr-draft { --op-prc: light-dark(#59636e, #9198a1); }
+.op-pr-merged { --op-prc: light-dark(#8250df, #ab7df8); }
+.op-pr-closed { --op-prc: light-dark(#cf222e, #f85149); }
+.op-issue { --op-prc: light-dark(#1a7f37, #3fb950); }
+.op-pr.op-stale { opacity: .55; border-style: dashed; }
+.op-ci { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.op-ci-pass { background: var(--op-done); }
+.op-ci-fail { background: var(--op-failed); }
+.op-ci-pending { background: var(--op-working); }
+.op-rv { font-size: 10px; line-height: 1; }
+.op-rv-approved { color: var(--op-done); }
+.op-rv-changes { color: var(--op-failed); }
+.op-rv-review { color: var(--op-muted); }
+.op-pr-x { color: var(--op-failed); font-weight: 700; }
+.op-meta > .op-pr { margin-left: auto; }
+.op-meta > .op-pr:first-child { margin-left: 0; }
+.op-ghc {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	font-size: 11px;
+	font-weight: 400;
+	color: var(--op-muted);
+}
+.op-ghead > .op-gname:has(+ .op-ghc) { flex: 0 1 auto; }
+.op-ghead > .op-pr { margin-left: 4px; }
+.op-ghc.op-stale { color: var(--op-question); }
+.op-ghs { display: flex; flex-direction: column; gap: 2px; margin-left: 4px; }
+.op-nested > .op-ghs { margin-left: 14px; }
+.op-ghs-head {
+	position: relative;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 24px;
+	padding: 0 4px 0 2px;
+	border-radius: 6px;
+	color: var(--op-muted);
+	font-size: 11px;
+	line-height: 1;
+	cursor: pointer;
+}
+.op-ghs-head:hover { background: light-dark(rgba(10, 10, 10, .04), rgba(38, 38, 38, .4)); }
+.op-ghs-head .op-chev { width: 16px; height: 16px; }
+.op-ghs.collapsed > .op-ghs-head .op-chev svg { transform: rotate(-90deg); }
+.op-ghs-t { font-weight: 500; color: var(--op-fg80); }
+.op-ghs-n { font-variant-numeric: tabular-nums; }
+.op-ghs-s { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; color: var(--op-muted60); }
+.op-ghs-s.op-stale { color: var(--op-question); }
+.op-ghs-acts { display: flex; align-items: center; gap: 2px; opacity: 0; transition: opacity 150ms cubic-bezier(.4, 0, .2, 1); }
+.op-ghs-head:hover .op-ghs-acts { opacity: 1; }
+.op-txt-g { font-size: 12px; line-height: 1; }
+.op-ghrow {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	height: 22px;
+	min-width: 0;
+	padding: 0 4px 0 22px;
+	border-radius: 6px;
+	color: var(--op-muted90);
+	font-size: 11px;
+	line-height: 1;
+	cursor: pointer;
+}
+.op-ghrow:hover { background: light-dark(rgba(10, 10, 10, .04), rgba(38, 38, 38, .4)); color: var(--op-fg); }
+.op-ghrow-t { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.op-ghrow-m { flex-shrink: 0; font-size: 10px; color: var(--op-question); }
+.op-ghmore, .op-ghnone { color: var(--op-muted60); }
+.op-ghnone { cursor: default; }

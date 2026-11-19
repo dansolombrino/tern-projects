@@ -29,6 +29,7 @@ require("./projects")(S)
 require("./pickers")(S)
 require("./mail")(S)
 require("./fleets")(S)
+require("./prs")(S)
 
 -- Commands --------------------------------------------------------------------------------
 
@@ -81,6 +82,7 @@ S.COMMANDS = {
 	{ id = "collapse_all", title = "Collapse or expand all projects", icon = "list", keys = { MOD .. "p" }, run = S.collapse_all },
 	{ id = "reveal", title = "Reveal active workspace", icon = "search", run = S.reveal_active },
 	{ id = "cleanup", title = "Delete a sleeping workspace", icon = "trash", run = S.cleanup },
+	{ id = "create_pr", title = "Create pull request for focused worktree", icon = "branch", run = S.create_pr },
 	{ id = "options", title = "Workspace options", icon = "sliders", run = S.options },
 	{ id = "settings", title = "Sidebar settings", icon = "gear", run = S.settings_picker },
 	{
@@ -176,6 +178,12 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	end
 	if act == "fleet_group" and value then
 		S.fleet_group(cx, value)
+	elseif act == "open_url" and value then
+		S.open_url(cx, value)
+	elseif act == "gh_refresh" and value then
+		S.gh_refresh(cx, value)
+	elseif act == "toggle_prs" and value then
+		S.toggle_prs(cx, value)
 	elseif act == "new_agent" then
 		S.new_agent_for(cx, value)
 	elseif act == "toggle_group" and value then

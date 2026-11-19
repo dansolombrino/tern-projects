@@ -148,6 +148,7 @@ local function fleet_snap(active: number?): { sidebar.FleetSnap }
 		for _, g in f.groups do
 			local items: { sidebar.FleetItemSnap } = {}
 			for _, it in g.items do
+				local pr, pr_stale = S.pr_for(it.worktree, it.branch)
 				table.insert(items, {
 					name = it.name,
 					title = it.title,
@@ -158,8 +159,11 @@ local function fleet_snap(active: number?): { sidebar.FleetSnap }
 					mailbox = it.mailbox,
 					queued = it.queued,
 					unread = fleet.unread(it, seen),
+					pr = pr,
+					pr_stale = pr_stale,
 				})
 			end
+			local gpr, gpr_stale = S.pr_for(g.worktree, g.branch)
 			table.insert(groups, {
 				key = g.key,
 				name = g.name,
@@ -168,6 +172,8 @@ local function fleet_snap(active: number?): { sidebar.FleetSnap }
 				session_live = g.session_live,
 				creating = g.creating,
 				items = items,
+				pr = gpr,
+				pr_stale = gpr_stale,
 			})
 		end
 		table.insert(out, {

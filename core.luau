@@ -83,6 +83,9 @@ export type AgentRow = {
 	primary: boolean?,
 	pinned: boolean?,
 	deleting: boolean?,
+	-- Its branch's PR (prs.luau) and whether that is stale.
+	pr: any?,
+	pr_stale: boolean?,
 	spawned: { AgentRow },
 	-- The owning project's id.
 	project: string?,
@@ -278,6 +281,22 @@ local function read_status()
 	if doc.fleet_sig ~= nil and doc.fleet_sig ~= S.fleet_sig and S.load_fleets then
 		S.fleet_sig = doc.fleet_sig
 		S.load_fleets()
+	end
+	-- Likewise the GitHub model (prs.luau), in a callback of its own (it may toast).
+	if doc.gh_sig ~= nil and doc.gh_sig ~= S.gh_sig and S.load_gh then
+		S.gh_sig = doc.gh_sig
+		tern.timer(0, function(cx)
+			local t0 = tern.now()
+			local ok, err = pcall(S.load_gh, cx)
+			if not ok then
+				tern.log.warn("projects: gh.json load failed", err)
+			end
+			local ms = tern.now() - t0
+			if ms > 25 then
+				tern.log.warn(string.format("projects: gh load took %.1f ms", ms))
+			end
+			S.dirty = true
+		end)
 	end
 end
 

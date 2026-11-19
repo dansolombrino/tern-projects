@@ -292,6 +292,12 @@ local function snapshot(cx: WindowCx): any
 			table.insert(panes, pane)
 		end
 	end
+	-- Each card's PR (prs.luau, from the host's gh.json), by the folder and branch it shows.
+	for _, row in rows do
+		if row.cwd ~= "" and row.branch then
+			row.pr, row.pr_stale = S.pr_for(row.cwd, row.branch)
+		end
+	end
 	table.sort(panes)
 	-- Spawned subagents nest under their live parent; everything else is a card.
 	local cards: { AgentRow } = {}
@@ -360,6 +366,7 @@ local function snapshot(cx: WindowCx): any
 			current = current.name == p.name,
 			agents = agents,
 			group = g,
+			gh = S.gh_project(p),
 		})
 		if not S.ui.collapsed[p.id] and not (g and S.ui.collapsed["group:" .. g.id]) then
 			for _, row in agents do
