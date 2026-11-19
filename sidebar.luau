@@ -1159,7 +1159,7 @@ local function fleet_group(snap: Snapshot, f: FleetSnap, g: FleetGroupSnap): any
 	end
 	return el("div", {
 		key = key_of("fg_", g.name),
-		class = "op-pgroup op-fgroup op-nested" .. (if shut then " collapsed" else ""),
+		class = "op-pgroup op-fgrp op-nested" .. (if shut then " collapsed" else ""),
 	}, children)
 end
 

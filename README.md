@@ -35,9 +35,9 @@ Orca's layout, top to bottom (`sidebar.luau`, `sidebar.css`):
 - **Projects** header (*Workspaces* when not grouped by project): collapse or expand all (shown on
   hover; also Alt-click any header), the **Activity** bell with its count (agents needing input, else
   working), **Workspace options**, **Add project**, **New agent**.
-- The list: a *Pinned* section, then project groups with their projects, then ungrouped projects,
-  then *Unassigned* for agents outside every project. Top-level headers stick while their section
-  scrolls.
+- The list: *Fleets* (one section per agent fleet, see below), a *Pinned* section, then project
+  groups with their projects, then ungrouped projects, then *Unassigned* for agents outside every
+  project. Top-level headers stick while their section scrolls.
 - Footer: **Settings**, **Help**, and **Reveal active workspace** (expands the groups above the
   focused agent's card and glows it).
 
@@ -72,6 +72,38 @@ One card per top-level agent, in Orca's new card style:
 - **Delete** asks first (the folder, its uncommitted changes; "don't ask again" is offered), stops
   every agent in the worktree, removes the worktree with `--force`, then deletes its branch with
   `git branch -d`. A branch git won't delete safely is kept, and you are offered to force it.
+
+### Fleets
+
+Agent fleets started with the agent-fleet skill's Tern adapter (`tern_fleet.py`) show above the
+projects the way Orca shows them: one section per fleet, its groups as containers, their workers as
+cards. Live: the host half re-reads the fleet state every 2 s and the sidebar redraws only the fleet
+that changed.
+
+- **Fleet row**: the fleet's name and a summary of its workers (`1 asks · 2 working · 1 done`). A
+  click collapses it.
+- **Coordinator card** (`L0 <fleet>`): its state (working, idle, needs you, gone), the session its
+  tab is in now, and how many mailbox messages wait for it. A click focuses it.
+- **Group row** (`G <group> · <fleet>`, or `l0-<group>` for a legacy group): a click shows the group's
+  session, or opens it again in the container worktree when it was ended; `…` collapses it. Every tab
+  of a group's session gets the group's color (one per group, stable), once per tab and only when the
+  tab has none, so a color you set stays.
+- **Worker card** (`L1 <group>/<item>`): a status dot and badge, *Working*, *Idle*, *Asks* (it asked
+  the coordinator and waits for the answer), *Needs you* (its agent waits for input in its pane),
+  *Done*, *Failed*, *Starting* or *Gone* (no pane in its worktree; dimmed); its branch; mail still
+  queued for it; and its last report (`ask: …`, `done: …`, `failed: …`) with its age. A report that
+  came after the coordinator was last focused is unread (amber dot, bold title) until you focus the
+  coordinator. A click focuses the worker (a gone one shows its group's session).
+- A fleet's coordinator and workers show only here, not again as project or *Unassigned* cards.
+- A group closed out (`close-out --confirm` archives it to `.closed/`) leaves the sidebar on the
+  next scan; a closed item (status `removed`) and a coordinator chat with no group left are hidden.
+
+Where it reads: the adapter's state root, `$AGENT_FLEET_STATE_DIR`, else `$XDG_STATE_HOME/agent-fleet`,
+else `~/.local/state/agent-fleet`, as Tern's daemon sees its environment; under it `.tern/<repo id>/`
+holds the coordinator chats (`chats/<key>/state.json`) and legacy `l0-<group>` groups
+(`<group>/state.json`). The plugin only reads them: a state file the script is replacing (missing
+beside its `.state.json.<pid>.tmp`, or half written) keeps the last good read, and a corrupt one with
+no earlier read is skipped. The model goes to `<data>/fleet.json` (`fleet.luau`, `fleets.luau`).
 
 ### Activity view
 
@@ -160,6 +192,10 @@ The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` h
 - The sidebar's width is re-measured (three `resize` probes) at most every 10 s, not every tick.
 - Reads are capped: 600 surface nodes per agent, every 6 s while it works and every 30 s while idle;
   6 transcript messages per prompt read; the keymap is read at most every 30 s.
+- Fleet state files are read and parsed by the host half (2 s budget, on its 2 s clock; an unchanged
+  file's text skips the parse), never by a window: a window re-reads the small `<data>/fleet.json`
+  only when `fleet_sig` in status.json changed. status.json also carries `fleet_ms` and
+  `fleet_ms_max`, the host's last and longest fleet scan (a scan over 200 ms is logged).
 
 ## Fleet mailbox
 
@@ -263,20 +299,21 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
 The fleet mailbox is under `mailbox.v1` (written by the host half only).
 
 The sidebar's state is under `projects.ui.v1`: whether it shows, its width, the collapsed sections,
-the list shown (projects or Activity), the workspace options, the pinned and unread cards and whether
-Delete asks.
+the list shown (projects or Activity), the workspace options, the pinned and unread cards, whether
+Delete asks, and when each fleet's coordinator was last focused (`fleet_seen`, for unread reports).
 
 Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
-queue and helper, pane sessions and branches), `mailbox.py` (the socket helper), `window.luau`
+queue and helper, pane sessions and branches, the fleet scan), `mailbox.py` (the socket helper), `window.luau`
 (commands, events, chrome and wiring), `core.luau` (the shared state, the agent scan, lookups),
 `budget.luau` (labelled, timed callbacks), `identity.luau` (records ↔ panes), `mailq.luau` (the
 mailbox queue), `mail.luau` (mailbox delivery and report-back in a window), `placement.luau` (the
 sidebar's docking, width and refresh), `snapshot.luau` (what the sidebar draws), `agents.luau`
 (starting agents, worktrees, report-back, sleep, wake, delete), `projects.luau` (project and group
 flows), `pickers.luau` (search, options, settings, help, Orca shortcuts), `model.luau` (data,
-ordering and persistence), `subagents.luau` (omp surface → subagents), `sidebar.luau` (snapshot →
-canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome and the title-bar
-toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
+ordering and persistence), `subagents.luau` (omp surface → subagents), `fleet.luau` (agent-fleet
+state → the fleet model, pure), `fleets.luau` (fleets in a window: states, clicks, unread, tab colors),
+`sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
+and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
 
 `window.luau` stays small on purpose: Luau allows 200 locals in a file's top level, which one file
 holding everything exceeded (`luau-compile -O0 --binary <file>` checks a file loads).
@@ -317,3 +354,6 @@ And the port's own:
 - The title-bar button and `⌃⌘E` toggle the sidebar instead of Files while the plugin is installed.
 - `chrome.css` hides the parked sidebar's card by its label (`Projects · …`), so a parked pane of
   your own titled "Projects" is hidden from the park pile too.
+- The sidebar follows you into a fleet group's session; a close-out that ends that session while
+  the sidebar shows there ends the sidebar with it (Tern gives no event before a session ends), and
+  the toggle opens it again.

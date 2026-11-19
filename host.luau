@@ -318,6 +318,9 @@ local fleet_json: string? = nil
 local FLEET_RUN = string.format("%d-%d", os.time(), math.random(1, 1000000))
 local fleet_sig = FLEET_RUN .. ".0"
 local fleet_n = 0
+-- How long the last fleet scan took and the longest one this run (ms), reported in status.json.
+local fleet_ms = 0
+local fleet_ms_max = 0
 
 local function mail_live(): { by_id: { [string]: string }, queued: { [number]: number } }
 	local by_id: { [string]: string } = {}
@@ -347,6 +350,7 @@ local function scan_fleets()
 	if FLEET_ROOT == nil or live == nil then
 		return
 	end
+	local t0 = tern.now()
 	local entries, cache = fleet.read_states(FLEET_ROOT :: string, {
 		list = tern.fs.list,
 		read = function(path: string): string?
@@ -358,6 +362,11 @@ local function scan_fleets()
 	local l = live :: fleet.Live
 	l.mail = mail_live()
 	local m = fleet.build(entries, l)
+	fleet_ms = tern.now() - t0
+	fleet_ms_max = math.max(fleet_ms_max, fleet_ms)
+	if fleet_ms > 200 then
+		tern.log.warn(string.format("projects: host fleet scan took %.1f ms", fleet_ms))
+	end
 	local text = tern.json.encode(m)
 	if text ~= fleet_json then
 		local ok, err = pcall(tern.fs.write, FLEET, text)
@@ -405,7 +414,15 @@ local function write_status()
 			queued += 1
 		end
 	end
-	local doc = { at = os.time(), panes = out_panes, repos = out_repos, queued = queued, fleet_sig = fleet_sig }
+	local doc = {
+		at = os.time(),
+		panes = out_panes,
+		repos = out_repos,
+		queued = queued,
+		fleet_sig = fleet_sig,
+		fleet_ms = math.floor(fleet_ms * 10 + 0.5) / 10,
+		fleet_ms_max = math.floor(fleet_ms_max * 10 + 0.5) / 10,
+	}
 	pcall(tern.fs.write, STATUS, tern.json.encode(doc))
 end
 

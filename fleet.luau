@@ -589,11 +589,18 @@ function fleet.live_of(doc: any): Live
 end
 
 -- What a worker's card says, from its record and its agent's live state in the window (`agent`: Tern's agent state of
--- its pane, nil when the window doesn't list it as an agent):
+-- its pane, nil when the window doesn't list it as an agent; `agent_cwd`: that agent's folder). The window's agent list
+-- is fresher than the host's last pane poll: an agent it lists in the item's worktree is live even when the host
+-- has not seen its pane yet.
 -- working | waiting (its agent needs the user) | ask (it asked the coordinator) | done | failed | idle | starting | gone.
-function fleet.item_state(item: Item, agent: string?): string
+function fleet.item_state(item: Item, agent: string?, agent_cwd: string?): string
 	if item.status == "start-failed" then
 		return "failed"
+	end
+	local seen_live = agent ~= nil and agent ~= "exited" and (item.worktree == nil or same_tree(agent_cwd, item.worktree))
+	if seen_live and item.liveness ~= "live" then
+		item = table.clone(item)
+		item.liveness = "live"
 	end
 	if item.liveness == "starting" or (item.status == "starting" and item.liveness ~= "live") then
 		return "starting"

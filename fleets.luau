@@ -75,7 +75,7 @@ local function load_fleets()
 				groups[g.key] = g
 				g.items = if type(g.items) == "table" then g.items else {}
 				for _, it in g.items do
-					if it.pane and it.liveness ~= "gone" then
+					if it.pane then
 						claimed[it.pane] = true
 					end
 				end
@@ -113,9 +113,12 @@ local function fleet_focused(pane: number?)
 	S.dirty = true
 end
 
-local function agent_state(pane: number?): string?
+local function agent_state(pane: number?): (string?, string?)
 	local b = if pane then S.blocks[pane] else nil
-	return if b then b.state else nil
+	if b == nil then
+		return nil, nil
+	end
+	return b.state, b.cwd
 end
 
 -- Whether a worker of `f` has a report its coordinator hasn't seen.

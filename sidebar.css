@@ -604,7 +604,7 @@ html[data-theme='dark'] .op-g-folder-tree { background-image: url("data:image/sv
 }
 .op-fhead > .op-gname { flex: 0 1 auto; }
 .op-fghead > .op-gname { font-weight: 500; }
-.op-fgroup > .op-card { margin-left: 24px; }
+.op-fgrp > .op-card { margin-left: 24px; }
 .op-fb {
 	display: inline-flex;
 	align-items: center;
