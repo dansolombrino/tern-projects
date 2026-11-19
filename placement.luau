@@ -19,7 +19,8 @@ local S: core.Ctx = nil :: any
 
 local function find_side(cx: WindowCx): number?
 	-- A canvas just opened can be missing from the canvas replica for a moment; its pane is already there.
-	if S.side_pane and (cx.canvas:get(S.side_pane) or cx.session:pane(S.side_pane)) then
+	-- The pane lookup first: `canvas:get` copies the whole drawn view.
+	if S.side_pane and (cx.session:pane(S.side_pane) or cx.canvas:get(S.side_pane)) then
 		return S.side_pane
 	end
 	S.side_pane = nil

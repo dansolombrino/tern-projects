@@ -191,8 +191,39 @@ local PRESETS: { [string]: boolean } = {
 	pink = true,
 }
 
+-- The node builders, in plain Lua: they make exactly the tables `tern.ui.el` and `tern.ui.node` return (checked
+-- live on Tern 0.9.28), without a native call per node, which made a draw of a few projects take 40-100 ms.
+local function copy_props(p: { [string]: any }?, into: { [string]: any }): { [string]: any }
+	if p then
+		for k, v in p do
+			into[k] = v
+		end
+	end
+	return into
+end
+sidebar.PURE_UI = {
+	el = function(tag: string, props: { [string]: any }?, children: { any }?): any
+		local n: { [string]: any } = { k = "el", p = copy_props(props, { tag = tag }) }
+		if children ~= nil and #children > 0 then
+			n.c = children
+		end
+		return n
+	end,
+	node = function(k: string, props: { [string]: any }?, children: { any }?): any
+		local n: { [string]: any } = { k = k }
+		local p = copy_props(props, {})
+		if next(p) ~= nil then
+			n.p = p
+		end
+		if children ~= nil and #children > 0 then
+			n.c = children
+		end
+		return n
+	end,
+}
+
 local function lib(): any
-	return sidebar.ui or tern.ui
+	return sidebar.ui or sidebar.PURE_UI
 end
 
 local function act(name: string, value: (string | number)?): string

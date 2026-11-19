@@ -420,7 +420,8 @@ local function key_of_node(node: any): string?
 	return if type(node) == "table" and type(node.p) == "table" and type(node.p.key) == "string" then node.p.key else nil
 end
 
--- Splits the view into its parts: the top-level children other than the list, and each child of the list.
+-- Splits the view into its parts, by the path `canvas:set{set = …}` takes (keys below the root, dot-joined; checked
+-- on Tern 0.9.28): the top-level children other than the list, and each child of the list (`list.<key>`).
 local function parts_of(view: any): (string?, { [string]: any })
 	local order: { string } = {}
 	local parts: { [string]: any } = {}
@@ -433,16 +434,18 @@ local function parts_of(view: any): (string?, { [string]: any })
 			table.insert(order, "list[" .. ((top.p and top.p.class) or "") .. "]")
 			for _, sec in kids(top) do
 				local sk = key_of_node(sec)
-				if sk == nil or parts[sk] then
+				local id = "list." .. (sk or "")
+				if sk == nil or parts[id] then
 					return nil, parts
 				end
-				table.insert(order, sk)
-				parts[sk] = sec
+				table.insert(order, id)
+				parts[id] = sec
 			end
 			table.insert(order, "/list")
 		else
-			table.insert(order, k)
-			parts[k] = top
+			local id = k
+			table.insert(order, id)
+			parts[id] = top
 		end
 	end
 	return table.concat(order, ","), parts
@@ -487,8 +490,17 @@ local function refresh_side(cx: WindowCx)
 		any = true
 	end
 	if any then
-		cx.canvas:set(side, spec)
-		d.parts, d.dock = json, dock_json
+		local ok, err = pcall(function()
+			cx.canvas:set(side, spec)
+		end)
+		if ok then
+			d.parts, d.dock = json, dock_json
+		else
+			-- The canvas no longer holds what we drew (replaced elsewhere): send it whole.
+			tern.log.warn("projects: partial sidebar update refused, redrawing whole", err)
+			cx.canvas:set(side, { view = view, dock = dock })
+			drawn = { pane = side, order = order :: string, parts = json, dock = dock_json }
+		end
 	end
 end
 

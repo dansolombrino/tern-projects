@@ -94,7 +94,12 @@ local function handle(msg: any): { [string]: any }
 		end
 		return reply
 	elseif op == "status" then
-		return mailq.status(box, msg)
+		local reply = mailq.status(box, msg)
+		if reply.ok and reply.error == nil then
+			-- The protocol spells a missing error as null.
+			reply.error = tern.json.null
+		end
+		return reply
 	end
 	return { ok = false, error = "bad-request", message = "unknown op " .. tostring(op) .. " (ping, deliver, status)" }
 end
@@ -226,11 +231,11 @@ local function read_repo(cwd: string)
 	local entry: Repo = r or { at = 0 }
 	entry.pending = true
 	repos[cwd] = entry
-	local ok = pcall(tern.process.run, { "git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD", "HEAD" }, { timeout_ms = 10000 }, function(res: ProcessResult)
+	local ok = pcall(tern.process.run, { "git", "-C", cwd, "rev-parse", "HEAD", "--abbrev-ref", "HEAD" }, { timeout_ms = 10000 }, function(res: ProcessResult)
 		entry.pending = nil
 		entry.at = os.time()
 		if res.status == 0 then
-			local name, sha = string.match(res.stdout, "^([^\n]*)\n([0-9a-f]+)")
+			local sha, name = string.match(res.stdout, "^([0-9a-f]+)\n([^\n]*)")
 			entry.branch = if name and name ~= "HEAD" then name else nil
 			entry.head = sha
 		else
