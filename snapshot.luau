@@ -529,9 +529,13 @@ local function changed(_cx: WindowCx?, _scanned: boolean?)
 	scan_pending = true
 	budget.later("scan", 0, function(scx)
 		scan_pending = false
-		S.scan(scx)
-		queue_reads()
-		redraw_soon()
+		if S.scan_list(scx) then
+			budget.later("bind", 0, function(_bcx)
+				S.scan_rest()
+				queue_reads()
+				redraw_soon()
+			end)
+		end
 	end)
 end
 

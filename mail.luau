@@ -28,8 +28,6 @@ local HOLD_MS = 120000
 -- A pane whose ask failed is retried after this long (ms), and the message fails after this many failures.
 local RETRY_MS = 10000
 local MAX_TRIES = 5
--- At most this many asks per delivery callback.
-local PER_PASS = 2
 
 local watcher: Child? = nil
 local unloading = false
@@ -59,31 +57,12 @@ local function enqueue(msg: { id: string, target: mailq.Target, text: string, fr
 end
 
 local pass_pending = false
+local pass: (cx: WindowCx) -> ()
+local pass_soon: () -> ()
 
--- One delivery pass: reads the queue, lists the agents fresh (never trusting a 2 s old state for #320), asks.
-local function pass(cx: WindowCx)
-	if not leader then
-		return
-	end
-	-- Reports the host has not applied yet could be sends of this very queue (a reload of this window loses
-	-- `sent`): wait until the spool is empty, so no message goes out twice.
-	local lsok, names = pcall(tern.fs.list, SPOOL)
-	if lsok and #names > 0 then
-		budget.later("mail", 500, pass)
-		return
-	end
-	local ok, raw = pcall(tern.kv.get, mailq.KEY)
-	local box = mailq.normalize(if ok then raw else nil)
-	-- Forget sends the host has applied.
-	for id in sent do
-		local m = mailq.find(box, id)
-		if m == nil or m.state ~= "queued" then
-			sent[id] = nil
-		end
-	end
-	if not mailq.pending(box) then
-		return
-	end
+-- Asks for the oldest deliverable message of `box`, one per callback: lists the agents fresh (never trusting a
+-- 2 s old state, tern-sdk#320), then one `ask`. Another pass follows while more could go out.
+local function ask_one(cx: WindowCx, box: mailq.Box)
 	local lok, list = pcall(function()
 		return cx.agents:list()
 	end)
@@ -103,40 +82,71 @@ local function pass(cx: WindowCx)
 			hold[pane] = nil
 		end
 	end
-	local asked = 0
+	local todo: { { msg: mailq.Msg, pane: number } } = {}
 	for _, d in mailq.deliverable(box, agents, S.sessions, identity.canon, held) do
-		if asked >= PER_PASS then
-			-- More to send: another callback, so this one stays small.
-			budget.later("mail", 0, pass)
-			break
+		if not sent[d.msg.id] then
+			table.insert(todo, d)
 		end
-		local id = d.msg.id
-		if not sent[id] then
-			local aok, err = pcall(function()
-				cx.agents:ask(d.pane, d.msg.text)
-			end)
-			hold[d.pane] = tern.now()
-			asked += 1
-			if aok then
-				-- Same callback as the ask: a reload cannot come between them.
-				sent[id] = true
-				ack(id, "delivered", d.pane)
-				tern.log.info("projects: mailbox delivered", id, d.pane)
-			else
-				tries[id] = (tries[id] or 0) + 1
-				tern.log.warn("projects: mailbox ask failed", id, d.pane, err)
-				if tries[id] >= MAX_TRIES then
-					sent[id] = true
-					ack(id, "failed", d.pane, tostring(err))
-				else
-					hold[d.pane] = tern.now() - HOLD_MS + RETRY_MS
-				end
-			end
+	end
+	local d = todo[1]
+	if d == nil then
+		return
+	end
+	local id = d.msg.id
+	local aok, err = pcall(function()
+		cx.agents:ask(d.pane, d.msg.text)
+	end)
+	hold[d.pane] = tern.now()
+	if aok then
+		-- Same callback as the ask: a reload cannot come between them.
+		sent[id] = true
+		ack(id, "delivered", d.pane)
+		tern.log.info("projects: mailbox delivered", id, d.pane)
+	else
+		tries[id] = (tries[id] or 0) + 1
+		tern.log.warn("projects: mailbox ask failed", id, d.pane, err)
+		if tries[id] >= MAX_TRIES then
+			sent[id] = true
+			ack(id, "failed", d.pane, tostring(err))
+		else
+			hold[d.pane] = tern.now() - HOLD_MS + RETRY_MS
 		end
+	end
+	if #todo > 1 then
+		-- More to send: another pass (it waits for the host to apply this one's report first).
+		pass_soon()
 	end
 end
 
-local function pass_soon()
+-- One delivery pass, in two callbacks: this one reads the queue; `ask_one` lists the agents and asks.
+pass = function(cx: WindowCx)
+	if not leader then
+		return
+	end
+	-- Reports the host has not applied yet could be sends of this very queue (a reload of this window loses
+	-- `sent`): wait until the spool is empty, so no message goes out twice.
+	local lsok, names = pcall(tern.fs.list, SPOOL)
+	if lsok and #names > 0 then
+		budget.later("mail", 500, pass)
+		return
+	end
+	local ok, raw = pcall(tern.kv.get, mailq.KEY)
+	local box = mailq.normalize(if ok then raw else nil)
+	-- Forget sends the host has applied.
+	for id in sent do
+		local m = mailq.find(box, id)
+		if m == nil or m.state ~= "queued" then
+			sent[id] = nil
+		end
+	end
+	if mailq.pending(box) then
+		budget.later("mail ask", 0, function(acx)
+			ask_one(acx, box)
+		end)
+	end
+end
+
+pass_soon = function()
 	if pass_pending then
 		return
 	end

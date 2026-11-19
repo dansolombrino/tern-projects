@@ -1249,6 +1249,56 @@ function sidebar.build(snap: Snapshot): { view: any, dock: any }
 	return { view = view, dock = footer() }
 end
 
+-- A sidebar canvas found in the window: its pane, the tab holding it (nil when parked or detached) and whether
+-- it is parked.
+export type CanvasSeen = { pane: number, tab: number?, parked: boolean? }
+
+-- Which one sidebar canvas to keep when the window holds several (a relaunched window or a reload that opened
+-- another): the one this run already uses, else one shown in the tab `here`, else any shown one, else the
+-- oldest (lowest pane id). Returns it (nil when there is none) and every other one, to close. Duplicates in
+-- `seen` count once.
+function sidebar.pick_canvas(seen: { CanvasSeen }, current: number?, here: number?): (number?, { number })
+	local by: { [number]: CanvasSeen } = {}
+	local panes: { number } = {}
+	for _, c in seen do
+		if by[c.pane] == nil then
+			by[c.pane] = c
+			table.insert(panes, c.pane)
+		end
+	end
+	table.sort(panes)
+	local keep: number? = nil
+	if current and by[current] then
+		keep = current
+	end
+	if keep == nil and here then
+		for _, p in panes do
+			if by[p].tab == here and not by[p].parked then
+				keep = p
+				break
+			end
+		end
+	end
+	if keep == nil then
+		for _, p in panes do
+			if by[p].tab ~= nil and not by[p].parked then
+				keep = p
+				break
+			end
+		end
+	end
+	if keep == nil then
+		keep = panes[1]
+	end
+	local extras: { number } = {}
+	for _, p in panes do
+		if p ~= keep then
+			table.insert(extras, p)
+		end
+	end
+	return keep, extras
+end
+
 -- A canvas_action's action name and value. Clicks arrive split (`ev.act`,
 -- `ev.value`); a scripted `cx.session:event(pane, {act = "focus=12"})` arrives
 -- unsplit, so split it here too. Panes come back as numbers (negative for

@@ -382,15 +382,24 @@ local function init(cx: WindowCx)
 		S.save_ui()
 	end
 	S.mail_start()
-	S.scan(cx)
-	local side = S.find_side(cx)
-	if S.ui.visible then
-		S.show_side(cx)
-	elseif side and not S.parked(cx, side) then
-		-- Shown by an earlier run that didn't persist it: keep it live.
-		S.redraw_soon()
-		S.start_ticker()
-	end
+	S.changed(cx)
+	-- A plugin load, reload or window relaunch never opens a sidebar: it takes up the one that exists (closing any
+	-- extra), once the canvas replica has caught up, and only the user's toggle opens a new one.
+	budget.later("adopt sidebar", 1500, function(acx)
+		local side = S.find_side(acx)
+		if side == nil then
+			return
+		end
+		if S.ui.visible then
+			S.show_side(acx)
+		elseif not S.parked(acx, side) then
+			-- Shown by an earlier run that didn't persist it: keep it live.
+			S.redraw_soon()
+			S.start_ticker()
+		end
+	end)
+	-- A relaunched window can list another canvas late: look again once.
+	budget.later("dedupe sidebar", 6000, S.dedupe_side)
 end
 
 tern.on("window_start", init)

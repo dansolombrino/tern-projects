@@ -42,13 +42,23 @@ function M.later(label: string, ms: number, fn: (cx: WindowCx) -> ()): TimerHand
 	end)
 end
 
--- The log line for a `budget` event: which hook paused, for how long, and the timer callback that ran last.
+-- The log line for a `budget` event: which hook paused, for how long, and the timer callback that ran last. The
+-- event names only the Lua budget (`ms`); Tern pauses a hook over that much Lua or ten times it of wall time with
+-- native calls, so both limits are named (Tern's own `exceeded` line just before says which).
 function M.describe(ev: BudgetEvent): string
 	if ev.state ~= "paused" then
 		return "projects: Tern resumed the " .. ev.hook .. " hook"
 	end
 	local culprit = if ev.hook == "timer" and last_label then " (last timer callback: " .. last_label .. ")" else ""
-	return string.format("projects: Tern paused the %s hook for %.0f s after it ran over %.0f ms%s", ev.hook, (ev.paused_ms or 0) / 1000, ev.ms or 0, culprit)
+	local ms = ev.ms or 50
+	return string.format(
+		"projects: Tern paused the %s hook for %.0f s after a callback ran over its budget, %.0f ms of Lua or %.0f ms of wall time with native calls%s",
+		ev.hook,
+		(ev.paused_ms or 0) / 1000,
+		ms,
+		ms * 10,
+		culprit
+	)
 end
 
 return M

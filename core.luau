@@ -37,6 +37,8 @@ local K = {
 	DRAW_MS = 20000,
 	-- How often a tick re-measures the sidebar's width against a window resize (no event exists for one).
 	FIT_MS = 10000,
+	-- How often a shown sidebar checks that it is the only sidebar canvas.
+	DEDUPE_MS = 30000,
 	-- How often a working agent's surface is re-read, and an idle one's.
 	WORK_READ_MS = 6000,
 	IDLE_READ_MS = 30000,
@@ -274,17 +276,16 @@ local function read_status()
 	S.status_at = if type(doc.at) == "number" then doc.at else 0
 end
 
--- Reads every agent block, binds agent records to their panes, and recomputes the status-line inputs. Marks the
--- sidebar dirty when anything it shows of the agents changed.
-local function scan(cx: WindowCx)
-	S.state = model.load()
-	local fresh: { [number]: AgentBlock } = {}
+-- The scan's first half, one native call: every agent block (`cx.agents:list()`), and whether any shown field of
+-- them changed. False when the list failed (the last one stands).
+local function scan_list(cx: WindowCx): boolean
 	local ok, list = pcall(function()
 		return cx.agents:list()
 	end)
 	if not ok then
-		return
+		return false
 	end
+	local fresh: { [number]: AgentBlock } = {}
 	local sig: { string } = {}
 	for _, b in list do
 		local block: AgentBlock = {
@@ -298,15 +299,29 @@ local function scan(cx: WindowCx)
 		table.insert(sig, string.format("%d|%s|%s|%s|%s", b.pane, block.state, block.cwd, block.model or "", block.last_message or ""))
 	end
 	S.blocks = fresh
+	table.sort(sig)
+	local asig = table.concat(sig, "\n")
+	if asig ~= S.agents_sig then
+		S.agents_sig = asig
+		S.dirty = true
+	end
+	return true
+end
+
+-- The scan's second half, on the blocks `scan_list` read: the state from kv, the host's status, records bound
+-- to panes (saved when that changed), and the status-line inputs.
+local function scan_rest()
+	S.state = model.load()
 	read_status()
 	local live: { [number]: { cwd: string } } = {}
-	for pane, b in fresh do
+	for pane, b in S.blocks do
 		live[pane] = { cwd = b.cwd }
 	end
 	local by_pane, changed = identity.bind(S.state.agents :: any, live, S.sessions, os.time())
 	S.pane_key = by_pane
 	if changed then
 		model.save(S.state)
+		S.dirty = true
 	end
 	local new_counts: { [string]: Counts } = {}
 	local new_panes: { [number]: string } = {}
@@ -330,23 +345,24 @@ local function scan(cx: WindowCx)
 			end
 		end
 	end
-	table.sort(sig)
 	local count_sig: { string } = {}
 	for id, c in new_counts do
 		table.insert(count_sig, string.format("%s=%d/%d", id, c.working, c.waiting))
 	end
 	table.sort(count_sig)
 	local csig = table.concat(count_sig, ",")
-	local asig = table.concat(sig, "\n") .. "\n" .. tostring(changed)
-	if asig ~= S.agents_sig or changed then
-		S.agents_sig = asig
-		S.dirty = true
-	end
 	S.counts, S.pane_project = new_counts, new_panes
 	-- The status segment only reads these: refresh it only when they changed.
 	if csig ~= S.counts_sig then
 		S.counts_sig = csig
 		tern.chrome.refresh()
+	end
+end
+
+-- The whole scan in one call, for user actions that need it now (timers split it, `scan_list` then `scan_rest`).
+local function scan(cx: WindowCx)
+	if scan_list(cx) then
+		scan_rest()
 	end
 end
 
@@ -652,6 +668,8 @@ local function new(): Ctx
 	S.project_of = project_of
 	S.save_ui = save_ui
 	S.scan = scan
+	S.scan_list = scan_list
+	S.scan_rest = scan_rest
 	S.set_unread = set_unread
 	S.title_of = title_of
 	S.unread_keys = unread_keys

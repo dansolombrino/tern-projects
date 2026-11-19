@@ -17,20 +17,61 @@ local S: core.Ctx = nil :: any
 
 -- Sidebar --------------------------------------------------------------------------
 
+-- Every sidebar canvas the window holds: from the canvas replica and from the panes (a relaunched window's
+-- replica can lag behind its panes; a pane is ours only when the replica confirms owner and title).
+local function sidebars(cx: WindowCx): { sidebar.CanvasSeen }
+	local out: { sidebar.CanvasSeen } = {}
+	local seen: { [number]: boolean } = {}
+	local function add(pane: number)
+		if seen[pane] then
+			return
+		end
+		seen[pane] = true
+		local info = cx.session:pane(pane)
+		table.insert(out, { pane = pane, tab = cx.session:tab_of(pane), parked = info ~= nil and info.parked == true })
+	end
+	for _, c in cx.canvas:list() do
+		if c.owner == ID and c.title == SIDE_TITLE then
+			add(c.pane)
+		end
+	end
+	for _, p in cx.session:panes() do
+		if p.kind == "canvas" and not seen[p.pane] then
+			local c = cx.canvas:get(p.pane)
+			if c and c.owner == ID and c.title == SIDE_TITLE then
+				add(p.pane)
+			end
+		end
+	end
+	return out
+end
+
+-- Keeps exactly one sidebar canvas: closes any other (a window relaunch or reload can leave several) and
+-- returns the kept one, else nil.
+local function dedupe_side(cx: WindowCx): number?
+	local focused = cx.session:focused()
+	local here = if focused then cx.session:tab_of(focused) else nil
+	local keep, extras = sidebar.pick_canvas(sidebars(cx), S.side_pane, here)
+	for _, pane in extras do
+		tern.log.warn("projects: closing an extra sidebar canvas", pane)
+		pcall(function()
+			cx.layout:close(pane)
+		end)
+	end
+	if keep ~= S.side_pane then
+		S.side_pane = keep
+		S.fitted = nil
+	end
+	return keep
+end
+
 local function find_side(cx: WindowCx): number?
-	-- A canvas just opened can be missing from the canvas replica for a moment; its pane is already there.
 	-- The pane lookup first: `canvas:get` copies the whole drawn view.
-	if S.side_pane and (cx.session:pane(S.side_pane) or cx.canvas:get(S.side_pane)) then
+	if S.side_pane and cx.session:pane(S.side_pane) then
 		return S.side_pane
 	end
 	S.side_pane = nil
-	for _, c in cx.canvas:list() do
-		if c.owner == ID and c.title == SIDE_TITLE then
-			S.side_pane = c.pane
-			return c.pane
-		end
-	end
-	return nil
+	return dedupe_side(cx)
 end
 
 local function parked(cx: WindowCx, pane: number): boolean
@@ -436,6 +477,9 @@ end
 -- When the width was last re-measured against a window resize.
 local measured_at = -math.huge
 
+-- When the sidebar canvases were last counted (a second one can appear from another window's run).
+local deduped_at = -math.huge
+
 -- One sidebar tick. Each step is a labelled callback of its own (budget.luau): this placement check (a width
 -- probe at most every FIT_MS, three `resize` calls), the scan (`cx.agents:list()` and the host's status), the reads
 -- it queues (one per turn), and a draw only when something shown changed or DRAW_MS passed.
@@ -454,12 +498,20 @@ local function tick_step(cx: WindowCx)
 		measured_at = tern.now()
 		refit_if_resized(cx, side)
 	end
+	if tern.now() - deduped_at >= K.DEDUPE_MS then
+		deduped_at = tern.now()
+		budget.later("dedupe sidebar", 0, dedupe_side)
+	end
+	-- The scan in two callbacks: listing the agents, then binding records and reading the host's status.
 	budget.later("scan", 0, function(scx)
-		S.scan(scx)
-		S.queue_reads()
-		if S.dirty or tern.now() - (S.drawn_at or -math.huge) >= K.DRAW_MS then
-			budget.later("draw", 0, S.refresh_side)
-		end
+		S.scan_list(scx)
+		budget.later("bind", 0, function(_bcx)
+			S.scan_rest()
+			S.queue_reads()
+			if S.dirty or tern.now() - (S.drawn_at or -math.huge) >= K.DRAW_MS then
+				budget.later("draw", 0, S.refresh_side)
+			end
+		end)
 	end)
 end
 
@@ -598,6 +650,7 @@ end
 return function(ctx: core.Ctx)
 	S = ctx
 	S.find_side = find_side
+	S.dedupe_side = dedupe_side
 	S.fit_later = fit_later
 	S.hide_side = hide_side
 	S.main_pane = main_pane
