@@ -1,8 +1,8 @@
 schema = 1
 id = "projects"
 name = "Projects & Agents"
-version = "0.3.0"
-description = "Multiple projects, multiple omp agents per project and subagents per agent, with worktrees, an Orca-style left sidebar and a fleet mailbox."
+version = "0.4.0"
+description = "Multiple projects, multiple omp agents per project and subagents per agent, with worktrees, an Orca-style left sidebar showing agent fleets, and a fleet mailbox."
 icon = "folder"
 host = "host.luau"
 window = "window.luau"
