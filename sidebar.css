@@ -589,3 +589,37 @@ html[data-theme='dark'] .op-g-folder-tree { background-image: url("data:image/sv
 	background: var(--op-bg);
 }
 .op-fgroup { display: flex; align-items: center; gap: 4px; }
+
+/* Fleets (agent-fleet): fleet header with a status summary, the coordinator card, group rows as containers, worker
+   cards with a status badge, their last report and its age. */
+.op-fsum {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	font-size: 11px;
+	font-weight: 400;
+	color: var(--op-muted);
+}
+.op-fhead > .op-gname { flex: 0 1 auto; }
+.op-fghead > .op-gname { font-weight: 500; }
+.op-fgroup > .op-card { margin-left: 24px; }
+.op-fb {
+	display: inline-flex;
+	align-items: center;
+	flex-shrink: 0;
+	height: 16px;
+	padding: 0 6px;
+	border-radius: 4px;
+	font-size: 10px;
+	font-weight: 500;
+	line-height: 1;
+	color: var(--op-muted);
+	background: color-mix(in srgb, var(--op-muted) 12%, transparent);
+}
+.op-fb-working, .op-fb-starting { color: var(--op-warning); background: color-mix(in srgb, var(--op-working) 14%, transparent); }
+.op-fb-waiting, .op-fb-ask { color: var(--op-question); background: color-mix(in srgb, var(--op-question) 14%, transparent); }
+.op-fb-done, .op-fb-idle { color: var(--op-done); background: color-mix(in srgb, var(--op-done) 12%, transparent); }
+.op-fb-failed { color: var(--op-failed); background: color-mix(in srgb, var(--op-failed) 12%, transparent); }
+.op-fq { flex-shrink: 0; font-size: 10px; color: var(--op-question); }
