@@ -8,6 +8,7 @@
 
 local model = require("./model")
 local subagents = require("./subagents")
+local identity = require("./identity")
 
 -- The context `new()` builds: the stateful helpers below read and write the shared state through it.
 local S: Ctx = nil :: any
@@ -30,13 +31,20 @@ local K = {
 	MAX_PX = 500,
 	-- The canvas pane's chrome around `.op-sidebar` (chrome.css drops Tern's inset, so none).
 	CHROME_PX = 0,
-	-- Sidebar refresh period while it shows, and how often idle agents' surfaces are re-read.
+	-- Sidebar tick period while it shows. Each tick re-reads the agents and the host's status and draws only when
+	-- something shown changed (or every DRAW_MS, for the "2m ago" labels).
 	TICK_MS = 2000,
-	IDLE_READ_MS = 10000,
-	-- How long a git branch read stays fresh, in seconds.
-	REPO_TTL = 15,
-	-- Surface nodes read per agent for its omp-internal subagents.
-	SURFACE_NODES = 2000,
+	DRAW_MS = 20000,
+	-- How often a tick re-measures the sidebar's width against a window resize (no event exists for one).
+	FIT_MS = 10000,
+	-- How often a working agent's surface is re-read, and an idle one's.
+	WORK_READ_MS = 6000,
+	IDLE_READ_MS = 30000,
+	-- Surface nodes read per agent for its omp-internal subagents, and transcript messages per prompt read.
+	SURFACE_NODES = 600,
+	TRANSCRIPT_LAST = 6,
+	-- The host half's status file is read at most this big.
+	STATUS_BYTES = 1048576,
 	-- Longest last message a report-back carries.
 	REPORT_CHARS = 6000,
 	-- How long a revealed card glows (Orca's flash).
@@ -80,8 +88,6 @@ export type AgentRow = {
 }
 
 export type Counts = { working: number, waiting: number }
-
-export type Repo = { branch: string?, head: string?, at: number, pending: boolean? }
 
 local function clean<T>(v: T?): T?
 	if v == (tern.json.null :: any) then
@@ -167,13 +173,43 @@ local function enqueue(job: (cx: WindowCx) -> ())
 	pump()
 end
 
--- The kv key of the card for `pane` (a sleeping card's pane is its record key, negated).
+-- The record key of the card for `pane`: a live agent's bound record (identity.luau), a sleeping card's record
+-- (its pane is a negative id of this run, `S.sleep_key`), else the pane id as text (an agent with no record).
 local function key_of(pane: number): string
-	return tostring(if pane < 0 then -pane else pane)
+	if pane < 0 then
+		return S.sleep_key[pane] or tostring(-pane)
+	end
+	return S.pane_key[pane] or tostring(pane)
 end
 
 local function meta_of(pane: number): model.AgentMeta?
 	return S.state.agents[key_of(pane)]
+end
+
+-- The live pane of record `key`, else nil.
+local function pane_of(key: string?): number?
+	if key == nil then
+		return nil
+	end
+	local m = S.state.agents[key :: string]
+	local p = if m then m.pane else nil
+	return if p and S.pane_key[p] == key then p else nil
+end
+
+-- The pane a card shows for record `key`: its live pane, else its sleeping id (assigned once per run).
+local function card_of_key(key: string): number
+	local live = pane_of(key)
+	if live then
+		return live
+	end
+	local id = S.sleep_pane[key]
+	if id == nil then
+		S.sleep_next -= 1
+		id = S.sleep_next
+		S.sleep_pane[key] = id
+		S.sleep_key[id] = key
+	end
+	return id
 end
 
 local function project_of(pane: number, cwd: string?): model.Project?
@@ -212,25 +248,66 @@ local function save_ui()
 	model.save_ui(S.ui)
 end
 
--- Reads every agent block and recomputes the status-line inputs.
+-- The host half's status (host.luau `write_status`): omp session file per pane, branch per folder, queued mail.
+-- Read every scan; a missing or half-written file keeps the last one.
+local function read_status()
+	local ok, text = pcall(tern.fs.read, tern.plugin.data .. "/status.json", K.STATUS_BYTES)
+	if not ok then
+		return
+	end
+	local dok, doc = pcall(tern.json.decode, text)
+	if not dok or type(doc) ~= "table" then
+		return
+	end
+	local sessions: { [number]: string } = {}
+	if type(doc.panes) == "table" then
+		for k, p in doc.panes do
+			local pane = tonumber(k)
+			if pane and type(p) == "table" and type(p.session_file) == "string" then
+				sessions[pane] = p.session_file
+			end
+		end
+	end
+	S.sessions = sessions
+	S.host_repos = if type(doc.repos) == "table" then doc.repos else {}
+	S.mail_queued = if type(doc.queued) == "number" then doc.queued else 0
+	S.status_at = if type(doc.at) == "number" then doc.at else 0
+end
+
+-- Reads every agent block, binds agent records to their panes, and recomputes the status-line inputs. Marks the
+-- sidebar dirty when anything it shows of the agents changed.
 local function scan(cx: WindowCx)
 	S.state = model.load()
 	local fresh: { [number]: AgentBlock } = {}
 	local ok, list = pcall(function()
 		return cx.agents:list()
 	end)
-	if ok then
-		for _, b in list do
-			fresh[b.pane] = {
-				pane = b.pane,
-				cwd = b.cwd or "",
-				state = b.state,
-				model = clean(b.model),
-				last_message = clean(b.last_message),
-			}
-		end
+	if not ok then
+		return
+	end
+	local sig: { string } = {}
+	for _, b in list do
+		local block: AgentBlock = {
+			pane = b.pane,
+			cwd = b.cwd or "",
+			state = b.state,
+			model = clean(b.model),
+			last_message = clean(b.last_message),
+		}
+		fresh[b.pane] = block
+		table.insert(sig, string.format("%d|%s|%s|%s|%s", b.pane, block.state, block.cwd, block.model or "", block.last_message or ""))
 	end
 	S.blocks = fresh
+	read_status()
+	local live: { [number]: { cwd: string } } = {}
+	for pane, b in fresh do
+		live[pane] = { cwd = b.cwd }
+	end
+	local by_pane, changed = identity.bind(S.state.agents :: any, live, S.sessions, os.time())
+	S.pane_key = by_pane
+	if changed then
+		model.save(S.state)
+	end
 	local new_counts: { [string]: Counts } = {}
 	local new_panes: { [number]: string } = {}
 	for pane, b in S.blocks do
@@ -246,30 +323,31 @@ local function scan(cx: WindowCx)
 			new_counts[p.id] = c
 		end
 	end
-	for _, cache in { S.internal, S.internal_at, S.tools, S.first_seen, S.prompts, S.prompt_stale, S.results, S.last_activity, S.expanded, S.idle_open } :: { { [number]: any } } do
+	for _, cache in { S.internal, S.internal_at, S.tools, S.first_seen, S.prompts, S.prompt_stale, S.results, S.last_activity, S.expanded, S.idle_open, S.surface_sig } :: { { [number]: any } } do
 		for pane in cache do
 			if S.blocks[pane] == nil and pane > 0 then
 				cache[pane] = nil
 			end
 		end
 	end
-	-- Branch reads only for folders a card shows: live agents' cwds and sleeping cards' worktrees.
-	local used: { [string]: boolean } = {}
-	for _, b in S.blocks do
-		used[b.cwd] = true
+	table.sort(sig)
+	local count_sig: { string } = {}
+	for id, c in new_counts do
+		table.insert(count_sig, string.format("%s=%d/%d", id, c.working, c.waiting))
 	end
-	for _, m in S.state.agents do
-		if m.closed and m.worktree then
-			used[m.worktree :: string] = true
-		end
-	end
-	for cwd, r in S.repos do
-		if not used[cwd] and not r.pending then
-			S.repos[cwd] = nil
-		end
+	table.sort(count_sig)
+	local csig = table.concat(count_sig, ",")
+	local asig = table.concat(sig, "\n") .. "\n" .. tostring(changed)
+	if asig ~= S.agents_sig or changed then
+		S.agents_sig = asig
+		S.dirty = true
 	end
 	S.counts, S.pane_project = new_counts, new_panes
-	tern.chrome.refresh()
+	-- The status segment only reads these: refresh it only when they changed.
+	if csig ~= S.counts_sig then
+		S.counts_sig = csig
+		tern.chrome.refresh()
+	end
 end
 
 local function focused_cwd(cx: WindowCx): (number?, string?)
@@ -285,12 +363,39 @@ local function focused_cwd(cx: WindowCx): (number?, string?)
 	return id, cwd
 end
 
+-- Runs git as a `tern.process.spawn` child: its output streams in (in chunks) and `cb` gets the whole result once
+-- it ended, like `tern.process.run` without holding the window's UI thread for the run.
 local function git(args: { string }, cb: (res: ProcessResult, cx: WindowCx?) -> (), timeout_ms: number?)
 	local argv = { "git" }
 	for _, a in args do
 		table.insert(argv, a)
 	end
-	tern.process.run(argv, { timeout_ms = timeout_ms or 30000 }, cb)
+	local out, err = {}, {}
+	local timed_out = false
+	local done = false
+	local ok, child = pcall(tern.process.spawn, argv, {
+		split = "chunks",
+		stdout = function(data: string)
+			table.insert(out, data)
+		end,
+		stderr = function(data: string)
+			table.insert(err, data)
+		end,
+		exit = function(res: SpawnExit, cx: WindowCx?)
+			done = true
+			cb({ status = if timed_out then -1 else res.status, stdout = table.concat(out), stderr = table.concat(err), timed_out = timed_out }, cx)
+		end,
+	})
+	if not ok then
+		cb({ status = -1, stdout = "", stderr = tostring(child), timed_out = false }, nil)
+		return
+	end
+	tern.timer(timeout_ms or 30000, function()
+		if not done then
+			timed_out = true
+			(child :: Child):kill()
+		end
+	end)
 end
 
 local function errtext(res: ProcessResult): string
@@ -349,10 +454,11 @@ local function card_pane(pane: number): number
 	local p = pane
 	for _ = 1, 32 do
 		local meta = meta_of(p)
-		if meta == nil or meta.parent == nil or S.blocks[meta.parent :: number] == nil then
+		local up = if meta then pane_of(meta.parent) else nil
+		if up == nil then
 			return p
 		end
-		p = meta.parent :: number
+		p = up :: number
 	end
 	return p
 end
@@ -362,9 +468,9 @@ local function unread_keys(pane: number): { string }
 	local keys: { string } = { key_of(pane) }
 	local i = 1
 	while i <= #keys do
-		local parent = tonumber(keys[i])
+		local parent = keys[i]
 		for k, m in S.state.agents do
-			if m.parent == parent and S.blocks[tonumber(k) or 0] then
+			if m.parent == parent and pane_of(k) and not table.find(keys, k) then
 				table.insert(keys, k)
 			end
 		end
@@ -445,8 +551,19 @@ export type Ctx = {
 	-- The card glowing after a reveal; tern.now() after which the glow is off, whatever happens to its timer.
 	reveal_pane: number?,
 	reveal_until: number,
-	-- Live git branch per cwd.
-	repos: { [string]: Repo },
+	-- From the host half's status file: omp session file per live pane, branch per folder, queued mail count.
+	sessions: { [number]: string },
+	host_repos: { [string]: { branch: string?, head: string? } },
+	mail_queued: number,
+	-- Live pane → bound record key (identity.luau), and the negative ids sleeping cards get in this run.
+	pane_key: { [number]: string },
+	sleep_pane: { [string]: number },
+	sleep_key: { [number]: string },
+	sleep_next: number,
+	-- Something the sidebar shows changed since its last draw; signatures of the last scan.
+	dirty: boolean,
+	agents_sig: string?,
+	counts_sig: string?,
 	-- Status-line inputs: agent counts per project id and each agent pane's project id.
 	counts: { [string]: Counts },
 	pane_project: { [number]: string },
@@ -461,9 +578,8 @@ export type Ctx = {
 	-- and whether the layout changed since the last settled fit.
 	fitted: { pane: number, ratio: number, near: number, font: number }?,
 	layout_dirty: boolean,
-	-- The last answer each spawned subagent reported, and reports waiting for their busy parent.
+	-- The last answer each spawned subagent reported (report-backs go through the mailbox, mail.luau).
 	reported: { [number]: string },
-	pending: { [number]: { string } },
 	[string]: any,
 }
 
@@ -500,8 +616,15 @@ local function new(): Ctx
 	-- The card glowing after a reveal; tern.now() after which the glow is off, whatever happens to its timer.
 	reveal_pane = nil :: number?,
 	reveal_until = 0,
-	-- Live git branch per cwd.
-	repos = {} :: { [string]: Repo },
+	sessions = {} :: { [number]: string },
+	host_repos = {} :: { [string]: any },
+	mail_queued = 0,
+	pane_key = {} :: { [number]: string },
+	sleep_pane = {} :: { [string]: number },
+	sleep_key = {} :: { [number]: string },
+	sleep_next = 0,
+	dirty = true,
+	surface_sig = {} :: { [number]: string },
 	-- Status-line inputs: agent counts per project id and each agent pane's project id.
 	counts = {} :: { [string]: Counts },
 	pane_project = {} :: { [number]: string },
@@ -516,11 +639,12 @@ local function new(): Ctx
 	-- and whether the layout changed since the last settled fit.
 	fitted = nil :: { pane: number, ratio: number, near: number, font: number }?,
 	layout_dirty = false,
-	-- The last answer each spawned subagent reported, and reports waiting for their busy parent.
+	-- The last answer each spawned subagent reported.
 	reported = {} :: { [number]: string },
-	pending = {} :: { [number]: { string } },
 	} :: any
 	S.card_pane = card_pane
+	S.card_of_key = card_of_key
+	S.pane_of = pane_of
 	S.clear_unread = clear_unread
 	S.cwd_of = cwd_of
 	S.enqueue = enqueue

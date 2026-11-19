@@ -30,7 +30,7 @@ export type Project = {
 export type AgentRow = {
 	-- Sleeping cards: a negative synthetic id, unique per record.
 	pane: number,
-	-- kv record key (sleeping cards) or tostring(pane).
+	-- The agent's record key (identity.luau), or tostring(pane) for an agent with no record.
 	key: string?,
 	-- Owning project's id (every row, children included); nil outside projects.
 	project: string?,

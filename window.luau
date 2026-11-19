@@ -11,6 +11,7 @@
 local model = require("./model")
 local sidebar = require("./sidebar")
 local core = require("./core")
+local budget = require("./budget")
 local ID = core.ID
 local MACOS = core.MACOS
 local MOD = core.MOD
@@ -26,6 +27,7 @@ require("./snapshot")(S)
 require("./agents")(S)
 require("./projects")(S)
 require("./pickers")(S)
+require("./mail")(S)
 
 -- Commands --------------------------------------------------------------------------------
 
@@ -224,7 +226,7 @@ end)
 -- An agent the user isn't looking at that finished or needs input is unread until focused or marked read.
 local function mark_unread(cx: WindowCx, pane: number)
 	if S.main_pane(cx, S.side_pane) ~= pane then
-		S.set_unread(tostring(pane), true)
+		S.set_unread(core.key_of(pane), true)
 	end
 end
 
@@ -240,9 +242,14 @@ local function last_line(pane: number): string?
 	return if b and b.last_message then short(firstline(b.last_message :: string), 120) else nil
 end
 
+-- Event hooks stay small (budget.luau): they note what happened from the last scan's cache and leave the scan,
+-- reads and drawing to labelled timer callbacks (`S.changed`).
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
-	S.scan(cx)
 	S.last_activity[ev.pane] = os.time()
+	local b = S.blocks[ev.pane]
+	if b then
+		b.state = ev.new
+	end
 	if ev.new == "working" then
 		S.results[ev.pane] = nil
 		S.prompt_stale[ev.pane] = true
@@ -251,16 +258,13 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 		mark_unread(cx, ev.pane)
 		cx:toast("info", who(ev.pane) .. " needs input", last_line(ev.pane))
 	end
-	if S.pending[ev.pane] and ev.new ~= "working" then
-		S.deliver(cx, ev.pane)
-	end
-	S.changed(cx, true)
+	S.mail_state(ev.pane, ev.old, ev.new)
+	S.changed(cx)
 end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
-	S.scan(cx)
 	if ev.result ~= "done" and ev.result ~= "failed" then
-		S.changed(cx, true)
+		S.changed(cx)
 		return
 	end
 	local t = os.time()
@@ -279,10 +283,16 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 			end
 		end
 	end
-	defer(function(dcx)
-		S.report_back(dcx, ev.pane, ev.result, 0)
-	end)
-	S.changed(cx, true)
+	if reports then
+		budget.later("report_back", 0, function(dcx)
+			S.report_back(dcx, ev.pane, ev.result, 0)
+		end)
+	end
+	S.changed(cx)
+end)
+
+tern.on("budget", function(ev: BudgetEvent, _cx: WindowCx)
+	tern.log.warn(budget.describe(ev))
 end)
 
 -- Focus moved: the focused agent is read, and the sidebar follows the user to another tab or session.
@@ -294,7 +304,7 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 		return
 	end
 	S.last_main = ev.pane
-	S.clear_unread(if S.card_pane(ev.pane) == ev.pane then S.unread_keys(ev.pane) else { tostring(ev.pane) })
+	S.clear_unread(if S.card_pane(ev.pane) == ev.pane then S.unread_keys(ev.pane) else { core.key_of(ev.pane) })
 	-- (Parked while shown: it waited for a tab with a pane to work in.)
 	if side and S.ui.visible and (S.parked(cx, side) or cx.session:tab_of(side) ~= ev.tab) then
 		S.show_side(cx)
@@ -306,10 +316,9 @@ tern.on("pane_created", function(_ev: PaneEvent, _cx: WindowCx)
 	S.layout_dirty = true
 end)
 
-tern.on("cwd", function(ev: CwdEvent, _cx: WindowCx)
-	S.repos[ev.path] = nil
+tern.on("cwd", function(ev: CwdEvent, cx: WindowCx)
 	if S.blocks[ev.pane] then
-		S.redraw_soon()
+		S.changed(cx)
 	end
 end)
 
@@ -325,9 +334,9 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 		S.last_main = nil
 	end
 	S.state = model.load()
-	local key = tostring(ev.pane)
+	local key = core.key_of(ev.pane)
 	local meta = S.state.agents[key]
-	if meta and meta.worktree then
+	if meta and meta.worktree and meta.parent == nil then
 		-- It sleeps as a card: its pin and unread mark stay, and whether it was cut off mid-turn persists.
 		meta.closed = true
 		meta.closed_at = os.time()
@@ -338,16 +347,15 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 			S.state.agents[key] = nil
 			model.save(S.state)
 		end
-		-- A later pane can get this id: drop the closed one's pin and unread mark.
 		S.ui = model.load_ui()
 		if S.ui.pinned[key] or S.ui.unread[key] then
 			S.ui.pinned[key], S.ui.unread[key] = nil, nil
 			S.save_ui()
 		end
 	end
+	S.pane_key[ev.pane] = nil
 	S.interrupted[key] = nil
 	S.reported[ev.pane] = nil
-	S.pending[ev.pane] = nil
 	S.changed(cx)
 	-- The layout may still hold the closed pane: then look again on the next turn.
 	if not S.rehome_side(cx) then
@@ -369,6 +377,11 @@ local function init(cx: WindowCx)
 	end
 	started = true
 	S.ui = model.load_ui()
+	S.state = model.load()
+	if model.migrate_ui(S.ui, S.state) then
+		S.save_ui()
+	end
+	S.mail_start()
 	S.scan(cx)
 	local side = S.find_side(cx)
 	if S.ui.visible then

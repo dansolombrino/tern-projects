@@ -48,8 +48,8 @@ export type AgentMeta = {
 	worktree: string?,
 	-- Branch the agent's worktree was created on.
 	branch: string?,
-	-- Pane of the parent agent, for spawned subagents.
-	parent: number?,
+	-- Record key of the parent agent, for spawned subagents.
+	parent: string?,
 	-- Ask the parent with the child's last message when the child's turn ends.
 	report_back: boolean?,
 	-- os.time() when started.
@@ -60,12 +60,19 @@ export type AgentMeta = {
 	closed_at: number?,
 	-- It was interrupted (stopped mid-turn) when it went to sleep.
 	interrupted: boolean?,
+	-- Identity (identity.luau): the pane it was last bound to, its omp session file and its folder. Pane ids
+	-- change across Tern restarts; the session file and the worktree re-attach the record.
+	pane: number?,
+	session_file: string?,
+	cwd: string?,
+	-- os.time() since when no live pane holds it (records without a worktree are forgotten after a while).
+	lost_at: number?,
 }
 
 export type State = {
 	projects: { Project },
 	groups: { Group },
-	-- Keyed by tostring(pane).
+	-- Keyed by an opaque record key (`model.new_key`), never by pane id.
 	agents: { [string]: AgentMeta },
 }
 
@@ -397,23 +404,69 @@ function model.normalize(raw: any): State
 	if type(raw.agents) == "table" then
 		for key, a in raw.agents do
 			if type(a) == "table" and type(a.project) == "string" and type(a.title) == "string" then
-				state.agents[tostring(key)] = {
+				local k = tostring(key)
+				local pane = if type(a.pane) == "number" then a.pane else nil
+				local parent = if type(a.parent) == "string" then a.parent else nil
+				-- Records of 0.2 were keyed by pane id, with the parent's pane: they keep that pane as a binding.
+				local legacy = model.legacy_key(k)
+				if legacy then
+					k, pane = legacy, tonumber(key)
+					if type(a.parent) == "number" then
+						parent = model.legacy_key(tostring(a.parent))
+					end
+				end
+				state.agents[k] = {
 					project = a.project,
 					title = a.title,
 					task = if type(a.task) == "string" then a.task else nil,
 					worktree = if type(a.worktree) == "string" then a.worktree else nil,
 					branch = if type(a.branch) == "string" then a.branch else nil,
-					parent = if type(a.parent) == "number" then a.parent else nil,
+					parent = parent,
 					report_back = if type(a.report_back) == "boolean" then a.report_back else nil,
 					started = if type(a.started) == "number" then a.started else 0,
 					closed = if a.closed == true then true else nil,
 					closed_at = if type(a.closed_at) == "number" then a.closed_at else nil,
 					interrupted = if a.interrupted == true then true else nil,
+					pane = pane,
+					session_file = if type(a.session_file) == "string" then a.session_file else nil,
+					cwd = if type(a.cwd) == "string" then a.cwd else nil,
+					lost_at = if type(a.lost_at) == "number" then a.lost_at else nil,
 				}
 			end
 		end
 	end
 	return state
+end
+
+-- The record key a 0.2 pane-id key ("123") migrates to, else nil.
+function model.legacy_key(key: string): string?
+	return if string.match(key, "^%d+$") then "a-m" .. key else nil
+end
+
+-- A new record key: opaque and stable for the record's life (it never changes with the agent's pane).
+local key_seq = 0
+function model.new_key(): string
+	key_seq += 1
+	return string.format("a%x-%x-%04x", os.time(), key_seq, math.random(0, 0xffff))
+end
+
+-- Moves 0.2 pane-keyed pins and unread marks to their migrated records' keys; true when any moved.
+function model.migrate_ui(ui: Ui, state: State): boolean
+	local moved = false
+	for _, set in { ui.pinned, ui.unread } do
+		local keys: { string } = {}
+		for k in set do
+			table.insert(keys, k)
+		end
+		for _, k in keys do
+			local nk = model.legacy_key(k)
+			if nk and state.agents[nk] then
+				set[nk], set[k] = set[k], nil
+				moved = true
+			end
+		end
+	end
+	return moved
 end
 
 -- Reads the state from `tern.kv` (empty when missing or unreadable).
@@ -991,12 +1044,6 @@ function model.collapse_all(ui: Ui, ids: { string })
 	for _, id in ids do
 		ui.collapsed[id] = if all then nil else true
 	end
-end
-
--- Moves a card's pin and unread mark to a new key (a woken sleeping card gets a new pane).
-function model.rekey_ui(ui: Ui, old: string, new: string)
-	ui.pinned[new], ui.pinned[old] = ui.pinned[old], nil
-	ui.unread[new], ui.unread[old] = ui.unread[old], nil
 end
 
 -- A terminal cell's width in em of the font size, as a split's share measures it in Tern 0.9.16 (13px font:

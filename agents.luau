@@ -5,6 +5,7 @@
 
 local model = require("./model")
 local core = require("./core")
+local budget = require("./budget")
 local K = core.K
 local MACOS = core.MACOS
 local ask_pick = core.ask_pick
@@ -34,6 +35,22 @@ local function goto_pane(cx: WindowCx, pane: number)
 	cx.layout:focus(pane)
 	S.last_main = pane
 	S.clear_unread(if S.card_pane(pane) == pane then S.unread_keys(pane) else { key_of(pane) })
+end
+
+-- The record key of agent `pane`, creating a record for an agent started by hand (named after its folder, under
+-- the project its folder belongs to, if any); leaves `S.state` loaded and saved.
+local function ensure_record(pane: number, cwd: string?): string
+	S.state = model.load()
+	local key = S.pane_key[pane]
+	if key and S.state.agents[key :: string] then
+		return key :: string
+	end
+	local p = model.project_for_path(S.state, cwd)
+	local nkey = model.new_key()
+	S.state.agents[nkey] = { project = if p then p.id else "", title = S.title_of(pane, cwd), started = 0, pane = pane, cwd = cwd }
+	model.save(S.state)
+	S.pane_key[pane] = nkey
+	return nkey
 end
 
 -- Agents ---------------------------------------------------------------------------
@@ -195,17 +212,21 @@ local function launch(cx: WindowCx, l: NewAgent)
 	start_agent(cx, { project = l.project, parent = l.parent, prompt = l.task, cwd = l.cwd }, function(pane, rcx)
 		local title = model.title_of(l.task)
 		S.state = model.load()
-		S.state.agents[tostring(pane)] = {
+		local key = model.new_key()
+		S.state.agents[key] = {
 			project = l.project.id,
 			title = title,
 			task = l.task,
 			worktree = l.worktree,
 			branch = l.branch,
-			parent = l.parent,
+			parent = if l.parent then key_of(l.parent :: number) else nil,
 			report_back = if l.parent then true else nil,
 			started = os.time(),
+			pane = pane,
+			cwd = l.cwd,
 		}
 		model.save(S.state)
+		S.pane_key[pane] = key
 		if l.parent == nil then
 			dress_tab(rcx, pane, title, l.project)
 		end
@@ -352,6 +373,8 @@ local function new_subagent_of(cx: WindowCx, parent: number)
 	local pmeta = S.meta_of(parent)
 	local ptitle = S.title_of(parent, b.cwd)
 	ask_text(cx, { placeholder = "Task for a subagent of " .. ptitle, icon = "sparkle", action = "start subagent" }, function(task, pcx)
+		-- The child's record names its parent by record key: an agent started by hand gets a record first.
+		ensure_record(parent, b.cwd)
 		launch(pcx, {
 			project = project :: model.Project,
 			task = task,
@@ -385,51 +408,25 @@ local function answer_of(cx: WindowCx, pane: number): string?
 	return nil
 end
 
--- Sends the parent its oldest queued report unless it is busy (the rest wait for its next idle).
-local function deliver(cx: WindowCx, parent: number)
-	local queue = S.pending[parent]
-	if queue == nil then
-		return
-	end
-	local pb = S.blocks[parent]
-	if pb == nil or pb.state == "exited" then
-		S.pending[parent] = nil
-		return
-	end
-	if pb.state == "working" then
-		return
-	end
-	local text = table.remove(queue, 1) :: string
-	if #queue == 0 then
-		S.pending[parent] = nil
-	end
-	local ok, err = pcall(function()
-		cx.agents:ask(parent, text)
-	end)
-	if not ok then
-		local q = S.pending[parent] or {}
-		table.insert(q, 1, text)
-		S.pending[parent] = q
-		cx:toast("error", "Report to " .. S.title_of(parent, pb.cwd) .. " not sent yet", tostring(err))
-	end
-end
-
--- Queues the spawned subagent's answer for its parent once its turn ended. The answer can trail the
--- event, so a turn without one is looked at again a few times.
+-- Queues the spawned subagent's answer for its parent once its turn ended, in the durable fleet mailbox
+-- (mail.luau), which delivers it when the parent is idle. The answer can trail the event, so a turn without one
+-- is looked at again a few times. One answer is one message: its id is the child's record and the answer's hash.
 local function report_back(cx: WindowCx, pane: number, result: string, tries: number)
 	local meta = S.meta_of(pane)
 	if meta == nil or meta.parent == nil or meta.report_back == false then
 		return
 	end
-	local parent = meta.parent :: number
+	local pkey = meta.parent :: string
+	local parent = S.state.agents[pkey]
+	local ppane = S.pane_of(pkey)
+	if parent == nil or (ppane == nil and parent.session_file == nil) then
+		return
+	end
 	local msg = answer_of(cx, pane)
 	if msg == nil then
 		if tries < 5 then
-			tern.timer(1000, function(tcx)
-				if tcx then
-					S.scan(tcx)
-					report_back(tcx, pane, result, tries + 1)
-				end
+			budget.later("report_back", 1000, function(tcx)
+				report_back(tcx, pane, result, tries + 1)
 			end)
 		end
 		return
@@ -438,10 +435,13 @@ local function report_back(cx: WindowCx, pane: number, result: string, tries: nu
 		return
 	end
 	S.reported[pane] = msg
-	local q = S.pending[parent] or {}
-	table.insert(q, string.format("Subagent %s finished (%s):\n\n%s", meta.title, result, short(msg, K.REPORT_CHARS) or ""))
-	S.pending[parent] = q
-	deliver(cx, parent)
+	local key = key_of(pane)
+	S.mail_enqueue({
+		id = "rb:" .. key .. ":" .. string.sub(tern.sha256(msg), 1, 16),
+		target = { pane = ppane, session_file = parent.session_file },
+		text = string.format("Subagent %s finished (%s):\n\n%s", meta.title, result, short(msg, K.REPORT_CHARS) or ""),
+		from = "projects subagent " .. meta.title,
+	})
 end
 
 -- Workspace actions (card menu) ------------------------------------------------------
@@ -455,15 +455,9 @@ local function rename_agent(cx: WindowCx, pane: number)
 			return
 		end
 		S.state = model.load()
-		local key = key_of(pane)
+		local key = ensure_record(pane, cwd)
 		local meta = S.state.agents[key]
-		if meta then
-			meta.title = text
-		else
-			-- An agent started by hand: keep its name under the project its folder belongs to (if any).
-			local p = model.project_for_path(S.state, cwd)
-			S.state.agents[key] = { project = if p then p.id else "", title = text, started = 0 }
-		end
+		meta.title = text
 		model.save(S.state)
 		local top = meta == nil or meta.parent == nil
 		local tab = if pane > 0 then rcx.session:tab_of(pane) else nil
@@ -482,11 +476,12 @@ local function sleep_agent(cx: WindowCx, pane: number)
 	S.scan(cx)
 	local b = S.blocks[pane]
 	if b and b.state == "working" then
-		S.interrupted[tostring(pane)] = true
+		S.interrupted[key_of(pane)] = true
 	end
+	local key = key_of(pane)
 	for p in S.blocks do
 		local m = S.meta_of(p)
-		if m and m.parent == pane then
+		if m and m.parent == key then
 			pcall(function()
 				cx.agents:stop(p)
 			end)
@@ -521,18 +516,20 @@ local function wake(cx: WindowCx, pane: number)
 	waking[key] = true
 	start_agent(cx, { project = project :: model.Project, prompt = m.task or m.title, cwd = wt }, function(new, rcx)
 		waking[key] = nil
-		local nkey = tostring(new)
 		S.state = model.load()
+		-- Same record, new pane (and a new omp session): its key, pin and unread mark stay.
 		local rec = S.state.agents[key] or m
-		S.state.agents[key] = nil
-		rec.closed, rec.closed_at, rec.interrupted, rec.started = nil, nil, nil, os.time()
-		S.state.agents[nkey] = rec
+		rec.closed, rec.closed_at, rec.interrupted, rec.lost_at, rec.started = nil, nil, nil, nil, os.time()
+		rec.pane, rec.session_file = new, nil
+		S.state.agents[key] = rec
 		model.save(S.state)
-		S.ui = model.load_ui()
-		model.rekey_ui(S.ui, key, nkey)
+		S.pane_key[new] = key
 		-- Waking is opening it: the woken agent is read.
-		S.ui.unread[nkey] = nil
-		S.save_ui()
+		S.ui = model.load_ui()
+		if S.ui.unread[key] then
+			S.ui.unread[key] = nil
+			S.save_ui()
+		end
 		S.interrupted[key] = nil
 		dress_tab(rcx, new, rec.title, project :: model.Project)
 	end, function()
@@ -640,7 +637,7 @@ local function run_delete(cx: WindowCx, pane: number)
 	for p, b in S.blocks do
 		local m = S.meta_of(p)
 		local inside = wt ~= nil and b.cwd ~= "" and model.inside(b.cwd, wt :: string)
-		if p == live or (live and m and m.parent == live) or inside then
+		if p == live or (live and m and m.parent == key) or inside then
 			pcall(function()
 				cx.agents:stop(p)
 			end)
@@ -773,7 +770,6 @@ return function(ctx: core.Ctx)
 	S.copy_name = copy_name
 	S.copy_path = copy_path
 	S.delete_agent = delete_agent
-	S.deliver = deliver
 	S.goto_pane = goto_pane
 	S.new_agent = new_agent
 	S.new_agent_for = new_agent_for

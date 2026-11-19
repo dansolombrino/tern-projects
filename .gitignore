@@ -1,3 +1,4 @@
 tern.d.luau
 .DS_Store
 .vscode/
+__pycache__/

@@ -145,14 +145,13 @@ local function cleanup(cx: WindowCx)
 	S.scan(cx)
 	local items: { PickItem } = {}
 	for key, meta in S.state.agents do
-		local n = tonumber(key)
-		if meta.closed and meta.worktree and n and S.blocks[n] == nil then
+		if meta.closed and meta.worktree and S.pane_of(key) == nil then
 			local p = model.get(S.state, meta.project)
 			table.insert(items, {
 				label = meta.title,
 				detail = (if p then p.name .. " · " else "") .. tilde(meta.worktree :: string),
 				icon = "moon",
-				pane = -n,
+				pane = S.card_of_key(key),
 			})
 		end
 	end

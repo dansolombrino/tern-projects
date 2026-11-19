@@ -6,6 +6,7 @@
 local model = require("./model")
 local sidebar = require("./sidebar")
 local core = require("./core")
+local budget = require("./budget")
 local ID = core.ID
 local K = core.K
 local SIDE_TITLE = core.SIDE_TITLE
@@ -431,36 +432,48 @@ local function rehome_side(cx: WindowCx): boolean
 	return true
 end
 
+-- When the width was last re-measured against a window resize.
+local measured_at = -math.huge
+
+-- One sidebar tick. Each step is a labelled callback of its own (budget.luau): this placement check (a width
+-- probe at most every FIT_MS, three `resize` calls), the scan (`cx.agents:list()` and the host's status), the reads
+-- it queues (one per turn), and a draw only when something shown changed or DRAW_MS passed.
+local function tick_step(cx: WindowCx)
+	local side = find_side(cx)
+	if side == nil or parked(cx, side) or rehome_side(cx) then
+		return
+	end
+	if side_ratio(cx, side) == nil then
+		place(cx, side)
+	elseif S.layout_dirty then
+		fit_later(side)
+	elseif not remember_drag(cx, side) and tern.now() - measured_at >= K.FIT_MS then
+		-- No resize event exists; a measure's probe and restore land within one callback, so no frame (nor a
+		-- program's pty) ever sees them.
+		measured_at = tern.now()
+		refit_if_resized(cx, side)
+	end
+	budget.later("scan", 0, function(scx)
+		S.scan(scx)
+		S.queue_reads()
+		if S.dirty or tern.now() - (S.drawn_at or -math.huge) >= K.DRAW_MS then
+			budget.later("draw", 0, S.refresh_side)
+		end
+	end)
+end
+
+-- The sidebar's clock while it shows.
 local function tick(gen: number)
-	tern.timer(K.TICK_MS, function(cx)
+	tern.timer(K.TICK_MS, function(tcx)
 		if gen ~= S.side_gen then
 			return
 		end
-		-- Re-armed first: a turn without a window, a sidebar missing for a moment or an error below never ends the
-		-- chain; hiding or closing the sidebar bumps `side_gen` instead.
+		-- Re-armed first: a turn without a window, a sidebar missing for a moment or an error below never ends
+		-- the chain; hiding or closing the sidebar bumps `side_gen` instead.
 		tick(gen)
-		if cx == nil then
-			return
+		if tcx then
+			budget.run("tick", tick_step, tcx)
 		end
-		local side = find_side(cx)
-		if side == nil or parked(cx, side) or rehome_side(cx) then
-			return
-		end
-		if side_ratio(cx, side) == nil then
-			place(cx, side)
-		elseif S.layout_dirty then
-			fit_later(side)
-		elseif not remember_drag(cx, side) then
-			-- Every settled tick: no resize event exists, and a measure's probe and restore land within one
-			-- callback, so no frame (nor a program's pty) ever sees them.
-			refit_if_resized(cx, side)
-		end
-		-- Reading and drawing get turns of their own.
-		defer(function(scx)
-			S.scan(scx)
-			S.queue_reads()
-			defer(S.refresh_side)
-		end)
 	end)
 end
 

@@ -1,6 +1,6 @@
 # Projects & Agents (`projects`)
 
-A Tern plugin (window half only, public plugin SDK) that ports the left sidebar of the Orca macOS
+A Tern plugin (host and window halves, public plugin SDK) that ports the left sidebar of the Orca macOS
 app (v1.4.253, new card style) and its workflow: **projects** in **project groups**, several **omp
 agents per project** (each a workspace card), and **subagents per agent**.
 
@@ -10,7 +10,9 @@ agents per project** (each a workspace card), and **subagents per agent**.
   In a git project each agent works in a git worktree of its own.
 - A subagent is a child omp agent started from a parent agent: it opens as a split beside the
   parent, in the parent's folder (and worktree). When the child's turn ends, its last message is
-  sent to the parent (report-back).
+  sent to the parent (report-back, through the fleet mailbox).
+- A **fleet mailbox** takes messages for agents from scripts (agent-fleet) over a Unix socket and
+  delivers each into its agent's chat when the agent is idle (see *Fleet mailbox*).
 - omp's own subagents (its task tool) are read from the parent's surface and shown nested under the
   agent, read-only.
 
@@ -18,7 +20,7 @@ agents per project** (each a workspace card), and **subagents per agent**.
 
 ```sh
 tern plugin link ~/src/tern-projects    # use it where it is; saving a file reloads it
-tern plugin list                        # projects … window  ready
+tern plugin list                        # projects … host, window  ready
 ```
 
 `tern plugin unlink projects` removes it. For type-checking, `tern plugin types ~/src/tern-projects`
@@ -133,7 +135,88 @@ docks it left of the tab's leftmost pane. It follows you to other tabs and sessi
 reopens with the window when it was shown. Its width is Orca's 280 px by default, or the width you
 last dragged it to (220 to 500 px), and is kept through splits opening and closing beside it.
 
-It redraws on agent, pane, focus and session events and every 2 s while shown.
+It refreshes on agent, pane, focus and session events and on a 2 s tick while shown, within Tern's
+window budget (50 ms per callback, see *Budget*): each tick re-reads the agents and the host half's
+status, and draws only when something it shows changed (or every 20 s, for the "5m" labels), sending
+only the changed sections.
+
+## Budget
+
+Tern pauses every timer of a plugin for 5 s (doubling up to 5 min) when one window callback runs over
+50 ms of Lua or 500 ms with native calls (`tern: timer exceeded 50 ms` in `~/Library/Logs/Tern/tern.log`).
+The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` here):
+
+- Work runs in labelled timer callbacks; event, click and command hooks only queue it. Each callback
+  does one heavy thing: the sidebar's placement check, the agent scan (`cx.agents:list()`), one surface
+  or transcript read, one draw, one mailbox delivery. A callback over 25 ms is logged with its label;
+  a pause names the label of the callback that ran last.
+- Git never runs on a window's UI thread in a hot path: branches are read by the host half, which
+  writes them to `<data>/status.json` with every pane's omp session file; worktree commands run as
+  `tern.process.spawn` children.
+- The sidebar's width is re-measured (three `resize` probes) at most every 10 s, not every tick.
+- Reads are capped: 600 surface nodes per agent, every 6 s while it works and every 30 s while idle;
+  6 transcript messages per prompt read; the keymap is read at most every 30 s.
+
+## Fleet mailbox
+
+Scripts (the agent-fleet skill) send messages to agents through the plugin: durable, delivered with
+`cx.agents:ask` (one atomic omp send) only while the agent is idle or waiting for input, never
+mid-turn (tern-sdk#320).
+
+**Where.** When its helper is up, the plugin writes `mailbox.json` into its data dir,
+`<config>/plugin-data/projects/`, where `<config>` is `$TERN_CONFIG_DIR`, else on macOS
+`~/Library/Application Support/Tern` (Linux: `~/.config/tern`, unverified):
+
+```json
+{"version": 1, "socket": "/Users/me/Library/Application Support/Tern/plugin-data/projects/mailbox.sock", "pid": 4242, "started_at": "2026-11-19T16:20:00+00:00"}
+```
+
+The socket is `mailbox.sock` in that dir, or `$TMPDIR/tern-projects-<uid>/mailbox.sock` when that
+path is over 100 bytes (Unix socket paths are short). The file is replaced when the helper restarts
+and removed when it stops (a killed helper leaves it: check that `pid` lives).
+
+**Protocol v1.** A Unix stream socket (mode 0600); one JSON object per line, one request per
+connection, the reply, then close.
+
+| Request | Reply |
+|---|---|
+| `{"op":"ping"}` | `{"ok":true,"version":1}` |
+| `{"op":"deliver","id":"<idempotency key>","target":{"pane":<id or null>,"cwd":"<abs path or null>","session_file":"<omp session file or null>"},"text":"<message>","from":"<label>"}` | `{"ok":true,"id":"…","state":"queued"\|"delivered"}` |
+| `{"op":"status","id":"…"}` | `{"ok":true,"id":"…","state":"queued"\|"delivered"\|"failed"\|"unknown","error":null\|"…"}` |
+
+Errors are `{"ok":false,"error":"<code>","message":"…"}`: `bad-request` (malformed request, text over
+64 KiB, id over 200 bytes), `no-target` (no live agent matches the target now; the message is not
+stored), `busy` (500 queued messages, or 50 for one target; or the host half did not answer within
+8 s: retry).
+
+**Semantics.**
+
+- `queued` means the message is in `kv.json` (key `mailbox.v1`): it survives plugin reloads and Tern
+  restarts. The same `id` again is the same message (its current state comes back), never a second
+  delivery. Delivered and failed messages are kept for `status` (and that rule) for 7 days, at most
+  5000 of them; a message still queued after 7 days fails as `expired`.
+- The target is resolved when the message goes out: the live agent in `pane`, else the agent whose
+  omp session file is `session_file` (a restart gives panes new ids; `omp --restore` reopens the same
+  file), else the one agent whose folder is `cwd`. Messages to one agent go out in order, one per turn
+  of the agent: the next waits until its turn ended.
+- `text` is sent exactly as given; `from` is a label for logs.
+- An ask Tern refuses is retried every 10 s and fails after 5 tries (`status` gives Tern's error).
+
+**How.** The host half (`host.luau`, in Tern's daemon) owns the queue (the only writer of
+`mailbox.v1`) and starts the helper `mailbox.py serve` with `tern.process.spawn`: Python 3 standard
+library, no dependencies. The helper relays each request to the host as a stdout line and the reply
+back. Every window half starts `mailbox.py watch`, which keeps a connection to the helper and prints
+a line on new mail and every 3 s: each line wakes the window, whose timers Tern stalls while nothing
+redraws it (tern-sdk#235). The first window watching delivers; it reports each delivery to the host
+through a file in `<data>/spool/`, written in the same callback as the ask, so a reload never sends a
+message twice. Subagent report-backs go into the same queue the same way.
+
+**Limits.**
+
+- Delivery needs an open Tern window (`cx.agents` exists only in a window). With none, messages wait
+  queued, and `deliver` still answers.
+- Only omp agents Tern knows as agents (`cx.agents`), in this Tern, are targets.
+- Delivery is into the agent's chat as a prompt; nothing shows a message before then.
 
 ## Adding projects, agents and worktrees
 
@@ -155,30 +238,41 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
 {
   projects = { { id, name, root, color, icon?, worktrees, created, group? } },
   groups = { { id, name, created } },
-  agents = { ["<pane>"] = { project, title, task, worktree?, branch?, parent?, report_back?, started, closed?, closed_at? } }
+  agents = { ["<key>"] = { project, title, task, worktree?, branch?, parent?, report_back?, started, closed?, closed_at?, pane?, session_file?, cwd?, lost_at? } }
 }
 ```
 
 - `id` is a slug of the first name; `name` is the session name; `color` is one of `neutral`, `red`,
   `orange`, `yellow`, `green`, `teal`, `purple`, `pink`; `icon` is `{ kind = "icon", name }` or
   `{ kind = "emoji", emoji }`.
-- Agents are keyed by pane id. An agent started by hand (no record) still belongs to the project
-  whose root, or worktree folder, holds its folder (the longest root wins).
+- Agents are keyed by an opaque record key, not by pane id (pane ids change across Tern restarts).
+  A record carries its last pane, its omp session file and its folder; after every agent scan
+  `identity.luau` binds each record to a live pane: its last pane while live, else the pane running
+  its omp session file, else (a worktree owner) the one agent in its worktree, else the one agent in
+  its folder. `parent` is the parent's record key. 0.2's pane-keyed records migrate on load.
+- An agent started by hand (no record) still belongs to the project whose root, or worktree folder,
+  holds its folder (the longest root wins).
 - A closed agent's record stays (`closed = true`) while it owns a worktree: that is its sleeping
-  card. Other records go when their block closes.
+  card. Other records go when their block closes, or an hour after their pane vanished without a
+  close (a restart that did not bring it back).
+
+The fleet mailbox is under `mailbox.v1` (written by the host half only).
 
 The sidebar's state is under `projects.ui.v1`: whether it shows, its width, the collapsed sections,
 the list shown (projects or Activity), the workspace options, the pinned and unread cards and whether
 Delete asks.
 
-Files: `plugin.toml` (manifest; `styles` loads the two sheets), `window.luau` (commands, events,
-chrome and wiring), `core.luau` (the shared state, the agent scan, lookups), `placement.luau` (the
+Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
+queue and helper, pane sessions and branches), `mailbox.py` (the socket helper), `window.luau`
+(commands, events, chrome and wiring), `core.luau` (the shared state, the agent scan, lookups),
+`budget.luau` (labelled, timed callbacks), `identity.luau` (records ↔ panes), `mailq.luau` (the
+mailbox queue), `mail.luau` (mailbox delivery and report-back in a window), `placement.luau` (the
 sidebar's docking, width and refresh), `snapshot.luau` (what the sidebar draws), `agents.luau`
 (starting agents, worktrees, report-back, sleep, wake, delete), `projects.luau` (project and group
 flows), `pickers.luau` (search, options, settings, help, Orca shortcuts), `model.luau` (data,
 ordering and persistence), `subagents.luau` (omp surface → subagents), `sidebar.luau` (snapshot →
 canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome and the title-bar
-toggle), `tests/` (pure tests: `luau tests/<file>.luau`).
+toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
 
 `window.luau` stays small on purpose: Luau allows 200 locals in a file's top level, which one file
 holding everything exceeded (`luau-compile -O0 --binary <file>` checks a file loads).
@@ -204,14 +298,13 @@ What Orca's sidebar does and this port can't, for lack of a Tern plugin API:
 
 And the port's own:
 
-- Pane ids key the records: agents restored by a Tern restart that changes pane ids lose their
-  title, worktree and parent links (they still show, attributed by folder).
+- Records re-attach after a restart by omp session file or worktree; an agent with neither whose
+  folder holds several agents stays unattached (it still shows, attributed by folder).
 - Report-back fires on every turn end of a spawned subagent (`done` or `failed`) that produced a new
-  answer (omp's stats footer stripped), while the parent agent is alive. Reports to a working parent
-  wait for its next idle; one Tern refuses is retried at the parent's next state change (a toast says
-  so). The in-memory queue is lost on a plugin reload.
+  answer (omp's stats footer stripped), while the parent agent has a live pane or a known session
+  file. It goes through the fleet mailbox: durable, delivered at the parent's next idle.
 - An agent's finished, failed or interrupted state is kept in memory: a plugin reload forgets it.
-- omp-internal subagents are read from at most 2000 surface nodes per agent; a longer transcript
+- omp-internal subagents are read from at most 600 surface nodes per agent; a longer transcript
   can hide older ones. They are read only while the sidebar shows.
 - Paths are local: projects on remote hosts aren't supported (git and file checks run on this
   machine).

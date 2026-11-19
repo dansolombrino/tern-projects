@@ -6,6 +6,7 @@ local model = require("./model")
 local subagents = require("./subagents")
 local sidebar = require("./sidebar")
 local core = require("./core")
+local budget = require("./budget")
 local K = core.K
 local MACOS = core.MACOS
 local action_id = core.action_id
@@ -16,7 +17,6 @@ local key_of = core.key_of
 local short = core.short
 
 type AgentRow = core.AgentRow
-type Repo = core.Repo
 
 -- The context: all shared state and the other modules' functions, set by the installer below.
 local S: core.Ctx = nil :: any
@@ -51,14 +51,24 @@ local function read_surface(cx: WindowCx, pane: number)
 		end
 	end
 	S.first_seen[pane] = seen
+	local tool = subagents.tool(tree)
+	local sig = { tool or "" }
+	for _, s in live do
+		table.insert(sig, string.format("%s|%s|%s|%s|%s", s.id, s.status, s.task or "", tostring(s.tools), tostring(s.cost)))
+	end
+	local joined = table.concat(sig, "\n")
+	if S.surface_sig[pane] ~= joined then
+		S.surface_sig[pane] = joined
+		S.dirty = true
+	end
 	S.internal[pane] = live
-	S.tools[pane] = subagents.tool(tree)
+	S.tools[pane] = tool
 end
 
--- Reads one agent's latest user prompt from its omp transcript.
+-- Reads one agent's latest user prompt from its omp transcript (the last few messages only).
 local function read_prompt(cx: WindowCx, pane: number)
 	local ok, msgs = pcall(function()
-		return cx.agents:transcript(pane, { last = 20 })
+		return cx.agents:transcript(pane, { last = K.TRANSCRIPT_LAST })
 	end)
 	S.prompt_stale[pane] = false
 	if not ok then
@@ -67,18 +77,23 @@ local function read_prompt(cx: WindowCx, pane: number)
 	for i = #msgs, 1, -1 do
 		local m = msgs[i]
 		if m.role == "user" and not blank(m.text) then
-			S.prompts[pane] = short(firstline(m.text), 200) :: string
+			local p = short(firstline(m.text), 200) :: string
+			if S.prompts[pane] ~= p then
+				S.prompts[pane] = p
+				S.dirty = true
+			end
 			return
 		end
 	end
 end
 
--- Re-reads, at most once per pane, the surfaces of working agents (the rest every IDLE_READ_MS) and stale
--- prompts, one read per timer turn.
+-- Re-reads, at most once per pane, the surfaces of working agents every WORK_READ_MS (the rest every
+-- IDLE_READ_MS) and stale prompts, one read per timer turn.
 local function queue_reads()
 	local t = tern.now()
 	for pane, b in S.blocks do
-		local due = b.state == "working" or S.internal_at[pane] == nil or t - (S.internal_at[pane] :: number) >= K.IDLE_READ_MS
+		local every = if b.state == "working" then K.WORK_READ_MS else K.IDLE_READ_MS
+		local due = S.internal_at[pane] == nil or t - (S.internal_at[pane] :: number) >= every
 		local skey = "s" .. pane
 		if due and b.state ~= "exited" and not S.queued[skey] then
 			S.queued[skey] = true
@@ -104,35 +119,16 @@ local function queue_reads()
 	end
 end
 
--- The live branch (or detached short sha) of `cwd`, read in the background when missing or old.
-local function repo_of(cx: WindowCx, cwd: string): (string?, string?)
-	local r = S.repos[cwd]
-	if (r == nil or os.time() - r.at >= K.REPO_TTL) and not (r and r.pending) then
-		local entry: Repo = r or { at = 0 }
-		entry.pending = true
-		S.repos[cwd] = entry
-		local ok, req = pcall(function()
-			return cx.git:repo(cwd)
-		end)
-		if ok then
-			req:next(function(repo, _err, _gcx)
-				entry.pending = nil
-				entry.at = os.time()
-				entry.branch = if repo then clean(repo.branch) else nil
-				entry.head = if repo then clean(repo.head) else nil
-			end)
-		else
-			entry.pending = nil
-			entry.at = os.time()
-		end
-	end
-	if r == nil then
+-- The branch (or detached short sha) of `cwd`, from the host half's status file (git runs there).
+local function repo_of(cwd: string): (string?, string?)
+	local r = S.host_repos[cwd]
+	if type(r) ~= "table" then
 		return nil, nil
 	end
-	if r.branch then
+	if type(r.branch) == "string" then
 		return r.branch, nil
 	end
-	return nil, if r.head then string.sub(r.head :: string, 1, 7) else nil
+	return nil, if type(r.head) == "string" then string.sub(r.head, 1, 7) else nil
 end
 
 -- Snapshot --------------------------------------------------------------------------
@@ -165,11 +161,20 @@ end
 
 -- Each of our commands' shortest effective chord, by command id, from the effective keymap (Tern 0.9.16's
 -- `actions:describe` doesn't know plugin commands). A chord counts when our command is its first action.
+-- Cached: the keymap is read at most every CHORDS_MS (the read lists every chord Tern knows).
+local CHORDS_MS = 30000
+local chords_cache: { [string]: string }? = nil
+local chords_at = -math.huge
 local function chords(cx: WindowCx): { [string]: string }
+	if chords_cache and tern.now() - chords_at < CHORDS_MS then
+		return chords_cache :: { [string]: string }
+	end
+	chords_at = tern.now()
 	local ok, keys = pcall(function()
 		return cx.actions:keys()
 	end)
 	local out: { [string]: string } = {}
+	chords_cache = out
 	if not ok then
 		return out
 	end
@@ -227,9 +232,9 @@ local function snapshot(cx: WindowCx): any
 		local res = if b.state ~= "working" then S.results[pane] else nil
 		local branch, detached = nil, nil
 		if b.cwd ~= "" then
-			branch, detached = repo_of(cx, b.cwd)
+			branch, detached = repo_of(b.cwd)
 		end
-		local key = tostring(pane)
+		local key = key_of(pane)
 		rows[pane] = {
 			pane = pane,
 			key = key,
@@ -257,11 +262,10 @@ local function snapshot(cx: WindowCx): any
 	end
 	-- Closed agents that still own a worktree: sleeping cards.
 	for key, meta in S.state.agents do
-		local n = tonumber(key)
-		if meta.closed and meta.worktree and meta.parent == nil and n and S.blocks[n] == nil then
-			local pane = -n
+		if meta.closed and meta.worktree and meta.parent == nil and S.pane_of(key) == nil then
+			local pane = S.card_of_key(key)
 			local wt = meta.worktree :: string
-			local branch, detached = repo_of(cx, wt)
+			local branch, detached = repo_of(wt)
 			local sp = S.project_of(pane, wt)
 			rows[pane] = {
 				pane = pane,
@@ -290,7 +294,8 @@ local function snapshot(cx: WindowCx): any
 	for _, pane in panes do
 		local row = rows[pane]
 		local meta = S.meta_of(pane)
-		local parent = if pane > 0 and meta and meta.parent then rows[meta.parent] else nil
+		local up = if pane > 0 and meta then S.pane_of(meta.parent) else nil
+		local parent = if up then rows[up] else nil
 		if parent then
 			table.insert(parent.spawned, row)
 		else
@@ -403,13 +408,88 @@ local function draw(cx: WindowCx): (Node, Node)
 	return out.view, out.dock
 end
 
+-- What the sidebar canvas shows now: its pane, the key order of the view's top level and of its list, and the
+-- JSON of each top-level part, list section and the dock, so a redraw sends only what changed.
+type Drawn = { pane: number, order: string, parts: { [string]: string }, dock: string }
+local drawn: Drawn? = nil
+
+local function kids(node: any): { any }
+	return if type(node) == "table" and type(node.c) == "table" then node.c else {}
+end
+local function key_of_node(node: any): string?
+	return if type(node) == "table" and type(node.p) == "table" and type(node.p.key) == "string" then node.p.key else nil
+end
+
+-- Splits the view into its parts: the top-level children other than the list, and each child of the list.
+local function parts_of(view: any): (string?, { [string]: any })
+	local order: { string } = {}
+	local parts: { [string]: any } = {}
+	for _, top in kids(view) do
+		local k = key_of_node(top)
+		if k == nil then
+			return nil, parts
+		end
+		if k == "list" then
+			table.insert(order, "list[" .. ((top.p and top.p.class) or "") .. "]")
+			for _, sec in kids(top) do
+				local sk = key_of_node(sec)
+				if sk == nil or parts[sk] then
+					return nil, parts
+				end
+				table.insert(order, sk)
+				parts[sk] = sec
+			end
+			table.insert(order, "/list")
+		else
+			table.insert(order, k)
+			parts[k] = top
+		end
+	end
+	return table.concat(order, ","), parts
+end
+
+-- Draws the sidebar: a full `canvas:set` when its shape changed (another pane, sections added, removed or
+-- reordered), else only the changed sections (`set` by key), else nothing.
 local function refresh_side(cx: WindowCx)
 	local side = S.find_side(cx)
 	if side == nil or S.parked(cx, side) then
 		return
 	end
+	S.dirty = false
+	S.drawn_at = tern.now()
 	local view, dock = draw(cx)
-	cx.canvas:set(side, { view = view, dock = dock })
+	local order, nodes = parts_of(view)
+	local json: { [string]: string } = {}
+	for k, n in nodes do
+		json[k] = tern.json.encode(n)
+	end
+	local dock_json = tern.json.encode(dock)
+	local d = drawn
+	if order == nil or d == nil or d.pane ~= side or d.order ~= order then
+		cx.canvas:set(side, { view = view, dock = dock })
+		drawn = if order then { pane = side, order = order :: string, parts = json, dock = dock_json } else nil
+		return
+	end
+	local change: { [string]: any } = {}
+	local any = false
+	for k, j in json do
+		if d.parts[k] ~= j then
+			change[k] = nodes[k]
+			any = true
+		end
+	end
+	local spec: CanvasChange = {}
+	if any then
+		spec.set = change
+	end
+	if d.dock ~= dock_json then
+		spec.dock = dock
+		any = true
+	end
+	if any then
+		cx.canvas:set(side, spec)
+		d.parts, d.dock = json, dock_json
+	end
 end
 
 -- A pending coalesced redraw.
@@ -421,21 +501,26 @@ local function redraw_soon()
 		return
 	end
 	refresh_pending = true
-	tern.timer(150, function(tcx)
+	budget.later("draw", 150, function(tcx)
 		refresh_pending = false
-		if tcx then
-			refresh_side(tcx)
-		end
+		refresh_side(tcx)
 	end)
 end
 
--- Refreshes everything event-driven: a scan now (unless the caller just did one), reads queued, a redraw soon.
-local function changed(cx: WindowCx, scanned: boolean?)
-	if not scanned then
-		S.scan(cx)
+-- Refreshes everything event-driven, never in the caller's callback: a scan, reads queued, then a redraw.
+local scan_pending = false
+local function changed(_cx: WindowCx?, _scanned: boolean?)
+	S.dirty = true
+	if scan_pending then
+		return
 	end
-	queue_reads()
-	redraw_soon()
+	scan_pending = true
+	budget.later("scan", 0, function(scx)
+		scan_pending = false
+		S.scan(scx)
+		queue_reads()
+		redraw_soon()
+	end)
 end
 
 -- Reveal ---------------------------------------------------------------------------

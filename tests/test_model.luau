@@ -115,21 +115,24 @@ test("persistence", function()
 	local s = model.empty()
 	local a = model.add_project(s, { name = "A", root = "/a" })
 	model.add_group(s, "G", a.id)
-	s.agents["5"] = { project = a.id, title = "t", started = 1, worktree = "/x", parent = 3, report_back = true, closed = true, closed_at = 9, interrupted = true }
+	s.agents["k5"] = { project = a.id, title = "t", started = 1, worktree = "/x", parent = "k3", report_back = true, closed = true, closed_at = 9, interrupted = true, pane = 77, session_file = "/s/5.jsonl", cwd = "/x" }
 	model.save(s)
 	local l = model.load()
 	eq(#l.projects, 1, "projects round-trip")
 	eq(l.projects[1].group, "g", "group membership round-trips")
 	eq(#l.groups, 1, "groups round-trip")
-	eq(l.agents["5"].title, "t", "agents round-trip")
-	eq(l.agents["5"].parent, 3, "parent kept")
-	eq(l.agents["5"].closed_at, 9, "closed_at kept")
-	eq(l.agents["5"].interrupted, true, "interrupted kept")
+	eq(l.agents["k5"].title, "t", "agents round-trip")
+	eq(l.agents["k5"].parent, "k3", "parent key kept")
+	eq(l.agents["k5"].closed_at, 9, "closed_at kept")
+	eq(l.agents["k5"].interrupted, true, "interrupted kept")
+	eq(l.agents["k5"].pane, 77, "pane binding kept")
+	eq(l.agents["k5"].session_file, "/s/5.jsonl", "session file kept")
+	eq(l.agents["k5"].cwd, "/x", "cwd kept")
 	local removed, keys = model.remove_project(l, a.id)
 	check(removed, "remove")
 	eq(#l.projects, 0, "removed")
-	eq(l.agents["5"], nil, "its agents removed")
-	eq(table.concat(keys, ","), "5", "removed agent keys returned")
+	eq(l.agents["k5"], nil, "its agents removed")
+	eq(table.concat(keys, ","), "k5", "removed agent keys returned")
 	check(not model.remove_project(l, "nope"), "remove unknown")
 	local n = model.normalize({
 		projects = { { id = 1 }, { id = "x", name = "X", root = "/x", color = "blue", group = "gone" } },
@@ -142,6 +145,27 @@ test("persistence", function()
 	eq(#n.groups, 1, "junk and duplicate groups dropped")
 	eq(next(n.agents), nil, "junk agents dropped")
 	eq(#model.normalize(nil).projects, 0, "nil is empty")
+end)
+
+test("0.2 pane-keyed records migrate", function()
+	local n = model.normalize({
+		projects = { { id = "p", name = "P", root = "/p" } },
+		agents = {
+			["12"] = { project = "p", title = "top", worktree = "/w", started = 1 },
+			["13"] = { project = "p", title = "kid", parent = 12, started = 2 },
+		},
+	})
+	eq(n.agents["12"], nil, "old key gone")
+	eq(n.agents["a-m12"].pane, 12, "old key becomes the pane binding")
+	eq(n.agents["a-m13"].parent, "a-m12", "parent pane becomes the parent's key")
+	local ui = model.normalize_ui({ pinned = { ["12"] = true, ["99"] = true }, unread = { ["13"] = true } })
+	check(model.migrate_ui(ui, n), "ui migrated")
+	eq(ui.pinned["a-m12"], true, "pin follows its record")
+	eq(ui.pinned["99"], true, "a pane with no record keeps its pin")
+	eq(ui.unread["a-m13"], true, "unread follows its record")
+	check(not model.migrate_ui(ui, n), "second migration is a no-op")
+	local k1, k2 = model.new_key(), model.new_key()
+	check(k1 ~= k2 and model.legacy_key(k1) == nil, "new keys are distinct and never legacy")
 end)
 
 test("groups", function()
@@ -297,9 +321,6 @@ test("ui state", function()
 	eq(l.want_px, 302, "ui round-trip")
 	eq(l.collapsed.a, true, "collapsed round-trip")
 	eq(l.show_branch, true, "show_branch round-trip")
-	u.unread["4"] = true
-	model.rekey_ui(u, "4", "9")
-	check(u.pinned["9"] and u.unread["9"] and not u.pinned["4"] and not u.unread["4"], "rekey moves pin and unread")
 end)
 
 test("collapse all", function()
