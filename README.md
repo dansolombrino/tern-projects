@@ -105,6 +105,48 @@ holds the coordinator chats (`chats/<key>/state.json`) and legacy `l0-<group>` g
 beside its `.state.json.<pid>.tmp`, or half written) keeps the last good read, and a corrupt one with
 no earlier read is skipped. The model goes to `<data>/fleet.json` (`fleet.luau`, `fleets.luau`).
 
+### Pull requests and issues
+
+Orca's PR and issue views, read with the GitHub CLI (`gh`, logged in: `gh auth login`). Only repositories with a
+github.com remote take part (`origin`, else the first github.com remote); a folder with no remote, or another host,
+shows nothing and costs no `gh` call.
+
+- **PR badge** on every card whose branch has a pull request: project worktree cards, fleet worker cards and fleet
+  group rows. It shows the number and state (`#12 open`, `draft`, `merged`, `closed`, in GitHub's colors), a CI dot
+  (green pass, red fail, amber running; none without checks), the review mark (✓ approved, ✗ changes requested,
+  • review required) and `!` on conflicts; the tooltip spells it out. A click opens the PR in the system browser.
+  The PR of a branch is its open PR, else the newest merged one, else the newest closed one; a PR from a fork is
+  never matched to a local branch of the same name.
+- **PRs & issues** under each GitHub project (collapsed by default; a click on its row expands it): the open PRs you
+  authored or are asked to review (`review asked`), then the open issues assigned to you, 8 of each with a
+  "N more on GitHub" row. Its row shows both counts and the data's age, `↻` refreshes now and `↗` opens the
+  repository's pull requests in the browser. The project header shows the counts too (`2 PRs · 1 issue`).
+- **Stale data.** When a refresh fails (offline, `gh` missing or logged out, an API error) the last good data stays,
+  dimmed and dashed, with `stale · 12m` on the row and `· stale` in the header; the row's tooltip names the error.
+  Data older than 15 min is stale too. The last good data is kept in `<data>/gh.json` and survives reloads.
+- **Create pull request for focused worktree** (palette): asks first, then pushes the focused agent's branch to
+  `origin` (`git push --set-upstream`) and runs `gh pr create --fill --head <branch>`; a toast gives the new PR's URL
+  or gh's error. It refuses a branch that already has an open PR, or a folder outside GitHub.
+- PRs and issues open in the system browser, never in a Tern browser pane (which would open in whatever session
+  is current), and only `https://github.com/…` links open.
+
+**Rate-limit policy.** `gh` runs only in the host half, as `tern.process.spawn` children, one at a time plugin-wide.
+Each repository is refreshed at most every 60 s while the sidebar shows and every 5 min while it is hidden: one
+`gh pr list --state open --limit 50` (with checks and reviews), one `gh issue list --assignee @me --limit 30`, and at
+most 4 `gh pr list --head <branch> --state all` lookups for shown branches with no open PR, each branch at most every
+5 min. A branch a card has just started to show is looked up within a few seconds instead (once, 4 per round, only
+while the repository's last refresh succeeded). So a project costs about 2 calls a minute (120 an hour) in steady
+state, well inside GitHub's 5000 GraphQL points an hour (measured: 3 repositories, 24 calls in 4 min). A failure
+backs that repository off, doubling from the interval up to 30 min, and at least 15 min
+after a rate-limit error; the refresh button asks for a refresh no sooner than 15 s after the last try and resets the
+backoff to one step. Each folder's remote is read with `git remote -v` (local, no network) at most every 10 min.
+No conditional requests (ETags): `gh pr list` and `gh issue list` go through GraphQL, which has none. status.json
+reports `gh_calls` (this host run), `gh_calls_hour` (the last hour) and `gh_last_ms` (the last process's run time).
+
+Settings, in kv key `projects.gh.v1` (no UI): `{"path": "/opt/homebrew/bin/gh"}` names the gh executable (default
+`gh` on the daemon's `PATH`), `{"off": true}` stops all GitHub calls. `gh` keeps its own token; the plugin never reads,
+stores or logs one (error lines are cut to their first line with anything token-shaped masked).
+
 ### Activity view
 
 The bell swaps the list for every agent, grouped by status (Needs you, Working, Done, Idle), each
@@ -137,6 +179,7 @@ Windows the chords use `Ctrl` instead of `⌘`.
 | Remove project (keeps files) | `remove` | | |
 | Reveal active workspace | `reveal` | | |
 | Delete a sleeping workspace | `cleanup` | | |
+| Create pull request for focused worktree | `create_pr` | | |
 | Workspace options | `options` | | |
 | Sidebar settings | `settings` | | |
 | Use Orca shortcuts | `use_orca_keys` | | |
@@ -196,6 +239,9 @@ The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` h
   file's text skips the parse), never by a window: a window re-reads the small `<data>/fleet.json`
   only when `fleet_sig` in status.json changed. status.json also carries `fleet_ms` and
   `fleet_ms_max`, the host's last and longest fleet scan (a scan over 200 ms is logged).
+- GitHub output is parsed by the host half (gh.luau, on its 5 s clock); a window re-reads the compact `<data>/gh.json`
+  only when `gh_sig` in status.json changed, in a timer callback of its own (logged when over 25 ms), and a change
+  redraws only the sections it touches (a project's section, a fleet).
 
 ## Fleet mailbox
 
@@ -296,14 +342,16 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
   card. Other records go when their block closes, or an hour after their pane vanished without a
   close (a restart that did not bring it back).
 
-The fleet mailbox is under `mailbox.v1` (written by the host half only).
+The fleet mailbox is under `mailbox.v1` (written by the host half only). GitHub settings are under
+`projects.gh.v1` (see *Pull requests and issues*); the GitHub data itself is in `<data>/gh.json`, not kv.
 
 The sidebar's state is under `projects.ui.v1`: whether it shows, its width, the collapsed sections,
 the list shown (projects or Activity), the workspace options, the pinned and unread cards, whether
-Delete asks, and when each fleet's coordinator was last focused (`fleet_seen`, for unread reports).
+Delete asks, when each fleet's coordinator was last focused (`fleet_seen`, for unread reports), and
+which projects' "PRs & issues" are expanded (`prs_open`).
 
 Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
-queue and helper, pane sessions and branches, the fleet scan), `mailbox.py` (the socket helper), `window.luau`
+queue and helper, pane sessions and branches, the fleet scan, GitHub polling), `mailbox.py` (the socket helper), `window.luau`
 (commands, events, chrome and wiring), `core.luau` (the shared state, the agent scan, lookups),
 `budget.luau` (labelled, timed callbacks), `identity.luau` (records ↔ panes), `mailq.luau` (the
 mailbox queue), `mail.luau` (mailbox delivery and report-back in a window), `placement.luau` (the
@@ -312,6 +360,8 @@ sidebar's docking, width and refresh), `snapshot.luau` (what the sidebar draws),
 flows), `pickers.luau` (search, options, settings, help, Orca shortcuts), `model.luau` (data,
 ordering and persistence), `subagents.luau` (omp surface → subagents), `fleet.luau` (agent-fleet
 state → the fleet model, pure), `fleets.luau` (fleets in a window: states, clicks, unread, tab colors),
+`gh.luau` (GitHub remotes, gh JSON, CI rollup, branch → PR, the refresh clock; pure), `ghpoll.luau` (gh polling in
+the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, refresh, create),
 `sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
 and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
 
@@ -334,8 +384,8 @@ What Orca's sidebar does and this port can't, for lack of a Tern plugin API:
 - Tooltip styling and delay, a live minimum and maximum while dragging the divider, the sidebar's
   tint behind the title bar, toast buttons, selecting several cards, image project icons, colors
   other than Orca's eight presets.
-- Orca's nav rows (Tasks, Automations, Agent Dashboard, Orca Mobile), workspace board, hosts, pull
-  requests, issue trackers and setup scripts have no counterpart here.
+- Orca's nav rows (Tasks, Automations, Agent Dashboard, Orca Mobile), workspace board, hosts, issue
+  trackers other than GitHub's and setup scripts have no counterpart here.
 
 And the port's own:
 
