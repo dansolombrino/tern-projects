@@ -6,6 +6,7 @@
 -- Tern pauses a plugin whose callback runs over 50 ms, so heavy work never shares a callback: surface and
 -- transcript reads run one per timer turn from a queue (`enqueue`), and flows hand each step to the next turn.
 
+local base = require("./base")
 local model = require("./model")
 local subagents = require("./subagents")
 local identity = require("./identity")
@@ -13,16 +14,14 @@ local identity = require("./identity")
 -- The context `new()` builds: the stateful helpers below read and write the shared state through it.
 local S: Ctx = nil :: any
 
-local ID = tern.plugin.id
+local ID = base.ID
 local HOME = tern.getenv("HOME")
-local MACOS = tern.runtime.os == "macos"
+local MACOS = base.MACOS
 local SIDE_TITLE = "Projects"
-local function action_id(cmd: string): string
-	return "plugin." .. ID .. "." .. cmd
-end
-local TOGGLE = action_id("toggle_sidebar")
-local MOD = if MACOS then "cmd+alt+shift+" else "ctrl+alt+shift+"
-local PRIMARY = if MACOS then "cmd+" else "ctrl+"
+local action_id = base.action_id
+local TOGGLE = base.TOGGLE
+local MOD = base.MOD
+local PRIMARY = base.PRIMARY
 -- Constants in one table.
 local K = {
 	-- Orca's default sidebar width and its drag limits, in px of the sidebar's content (`.op-sidebar`).

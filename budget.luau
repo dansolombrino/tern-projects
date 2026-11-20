@@ -15,17 +15,21 @@ local M = {}
 
 -- A callback taking longer than this is logged (well under the 50 ms that pauses the hook).
 M.SLOW_MS = 25
+-- A staged module load (window.luau) taking longer than this is logged: `require`'s compile counts only toward the
+-- 500 ms of wall time, and the largest module takes 35-125 ms to compile.
+M.SLOW_LOAD_MS = 250
 
 -- The label of the timer callback that started last.
 local last_label: string? = nil
 
--- Runs `fn(arg)` (pcall'd and timed) under `label`; errors are logged, never raised.
-function M.run(label: string, fn: (any) -> (), arg: any)
+-- Runs `fn(arg)` (pcall'd and timed) under `label`; errors are logged, never raised. Over `slow_ms` (default
+-- `SLOW_MS`) it is logged as slow.
+function M.run(label: string, fn: (any) -> (), arg: any, slow_ms: number?)
 	last_label = label
 	local t0 = tern.now()
 	local ok, err = pcall(fn, arg)
 	local ms = tern.now() - t0
-	if ms > M.SLOW_MS then
+	if ms > (slow_ms or M.SLOW_MS) then
 		tern.log.warn(string.format("projects: %s took %.1f ms", label, ms))
 	end
 	if not ok then

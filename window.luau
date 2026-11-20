@@ -5,68 +5,84 @@
 -- bar), a status segment and toasts. This file registers commands, events and chrome and wires the modules:
 -- core.luau (constants, shared state in one context table, base helpers), placement.luau (sidebar docking and
 -- width), snapshot.luau (reads and drawing), agents.luau (agent flows, worktrees), projects.luau (project and
--- group flows), pickers.luau (navigation, options, settings, help). model.luau holds the data, subagents.luau
--- and sidebar.luau the pure surface reading and drawing.
+-- group flows), pickers.luau (navigation, options, settings, help), events.luau (what the hooks do).
+-- model.luau holds the data, subagents.luau and sidebar.luau the pure surface reading and drawing.
+--
+-- Loading is staged (README, Budget): Tern counts `require`'s compile toward the load's 500 ms of wall time, and
+-- compiling every module took 240-310 ms on an idle machine and 350-470 ms (sometimes over 500) under load. So the
+-- load requires only base.luau and budget.luau and registers the hooks (2-6 ms); the modules compile one per timer
+-- callback (`STAGES`), and a hook arriving before `init` is queued and runs, in order, right after it.
 
-local model = require("./model")
-local sidebar = require("./sidebar")
-local core = require("./core")
+local base = require("./base")
 local budget = require("./budget")
-local ID = core.ID
-local MACOS = core.MACOS
-local MOD = core.MOD
-local TOGGLE = core.TOGGLE
-local defer = core.defer
-local firstline = core.firstline
-local short = core.short
+local ID = base.ID
+local MACOS = base.MACOS
+local MOD = base.MOD
 
--- The one context table every module shares; each installer adds its functions to it.
-local S = core.new()
-require("./placement")(S)
-require("./snapshot")(S)
-require("./agents")(S)
-require("./projects")(S)
-require("./pickers")(S)
-require("./mail")(S)
-require("./fleets")(S)
-require("./prs")(S)
-require("./autowin")(S)
+-- The context table every module shares (core.luau's `Ctx`) and events.luau's handlers: nil until loaded.
+local S: any = nil
+local H: any = nil
+-- Hooks that arrived before H was set, run in order after `init`.
+local queued: { (cx: WindowCx) -> () } = {}
 
--- Commands --------------------------------------------------------------------------------
-
-local function with_agent(fn: (cx: WindowCx, pane: number) -> ()): (cx: WindowCx) -> ()
-	return function(cx: WindowCx)
-		local pane = S.focused_agent(cx)
-		if pane then
-			fn(cx, pane)
-		end
+-- Runs `fn(cx)` now once loaded, else queues it.
+local function when(cx: WindowCx, fn: (cx: WindowCx) -> ())
+	if H then
+		fn(cx)
+	else
+		table.insert(queued, fn)
 	end
 end
 
-S.COMMANDS = {
-	{ id = "toggle_sidebar", title = "Toggle sidebar", icon = "sidebar", keys = { if MACOS then "alt+cmd+b" else "ctrl+alt+b" }, run = S.toggle_side },
-	{ id = "search", title = "Search agents and projects", icon = "search", keys = { MOD .. "k" }, run = S.search },
-	{ id = "add", title = "Add project", icon = "folder-plus", run = S.add_project },
-	{ id = "remove", title = "Remove project (keeps files)", icon = "trash", run = S.remove_project },
+-- Commands --------------------------------------------------------------------------------
+
+local function call(name: string): (cx: WindowCx) -> ()
+	return function(cx: WindowCx)
+		when(cx, function(c)
+			S[name](c)
+		end)
+	end
+end
+
+local function with_agent(name: string): (cx: WindowCx) -> ()
+	return function(cx: WindowCx)
+		when(cx, function(c)
+			local pane = S.focused_agent(c)
+			if pane then
+				S[name](c, pane)
+			end
+		end)
+	end
+end
+
+local COMMANDS: { CommandDef } = {
+	{ id = "toggle_sidebar", title = "Toggle sidebar", icon = "sidebar", keys = { if MACOS then "alt+cmd+b" else "ctrl+alt+b" }, run = call("toggle_side") },
+	{ id = "search", title = "Search agents and projects", icon = "search", keys = { MOD .. "k" }, run = call("search") },
+	{ id = "add", title = "Add project", icon = "folder-plus", run = call("add_project") },
+	{ id = "remove", title = "Remove project (keeps files)", icon = "trash", run = call("remove_project") },
 	{
 		id = "open",
 		title = "Open project",
 		icon = "folder",
 		keys = { MOD .. "l" },
 		run = function(cx)
-			S.pick_project(cx, "Project to open", S.open_project)
+			when(cx, function(c)
+				S.pick_project(c, "Project to open", S.open_project)
+			end)
 		end,
 	},
-	{ id = "new_agent", title = "New agent in project", icon = "sparkle", keys = { MOD .. "a" }, run = S.new_agent },
-	{ id = "new_subagent", title = "New subagent of focused agent", icon = "sparkle", keys = { MOD .. "u" }, run = with_agent(S.new_subagent_of) },
-	{ id = "next_waiting", title = "Jump to next agent waiting for input", icon = "bell", keys = { MOD .. "j" }, run = S.next_waiting },
+	{ id = "new_agent", title = "New agent in project", icon = "sparkle", keys = { MOD .. "a" }, run = call("new_agent") },
+	{ id = "new_subagent", title = "New subagent of focused agent", icon = "sparkle", keys = { MOD .. "u" }, run = with_agent("new_subagent_of") },
+	{ id = "next_waiting", title = "Jump to next agent waiting for input", icon = "bell", keys = { MOD .. "j" }, run = call("next_waiting") },
 	{
 		id = "prev_agent",
 		title = "Previous agent",
 		icon = "arrow-left",
 		keys = { MOD .. "," },
 		run = function(cx)
-			S.step_agent(cx, -1)
+			when(cx, function(c)
+				S.step_agent(c, -1)
+			end)
 		end,
 	},
 	{
@@ -75,23 +91,27 @@ S.COMMANDS = {
 		icon = "arrow-down",
 		keys = { MOD .. "." },
 		run = function(cx)
-			S.step_agent(cx, 1)
+			when(cx, function(c)
+				S.step_agent(c, 1)
+			end)
 		end,
 	},
-	{ id = "rename", title = "Rename focused agent", icon = "agent", keys = { MOD .. "r" }, run = with_agent(S.rename_agent) },
-	{ id = "delete", title = "Delete focused agent's workspace", icon = "trash", keys = { MOD .. "backspace" }, run = with_agent(S.delete_agent) },
-	{ id = "collapse_all", title = "Collapse or expand all projects", icon = "list", keys = { MOD .. "p" }, run = S.collapse_all },
-	{ id = "reveal", title = "Reveal active workspace", icon = "search", run = S.reveal_active },
-	{ id = "cleanup", title = "Delete a sleeping workspace", icon = "trash", run = S.cleanup },
-	{ id = "create_pr", title = "Create pull request for focused worktree", icon = "branch", run = S.create_pr },
-	{ id = "new_automation", title = "New automation", icon = "sparkle", run = S.auto_new },
-	{ id = "edit_automations", title = "Edit automations (automations.json)", icon = "doc", run = S.auto_edit },
+	{ id = "rename", title = "Rename focused agent", icon = "agent", keys = { MOD .. "r" }, run = with_agent("rename_agent") },
+	{ id = "delete", title = "Delete focused agent's workspace", icon = "trash", keys = { MOD .. "backspace" }, run = with_agent("delete_agent") },
+	{ id = "collapse_all", title = "Collapse or expand all projects", icon = "list", keys = { MOD .. "p" }, run = call("collapse_all") },
+	{ id = "reveal", title = "Reveal active workspace", icon = "search", run = call("reveal_active") },
+	{ id = "cleanup", title = "Delete a sleeping workspace", icon = "trash", run = call("cleanup") },
+	{ id = "create_pr", title = "Create pull request for focused worktree", icon = "branch", run = call("create_pr") },
+	{ id = "new_automation", title = "New automation", icon = "sparkle", run = call("auto_new") },
+	{ id = "edit_automations", title = "Edit automations (automations.json)", icon = "doc", run = call("auto_edit") },
 	{
 		id = "automation_runs",
 		title = "Automation runs",
 		icon = "list",
 		run = function(cx)
-			S.auto_pick(cx, "Automation", S.auto_runs)
+			when(cx, function(c)
+				S.auto_pick(c, "Automation", S.auto_runs)
+			end)
 		end,
 	},
 	{
@@ -99,393 +119,211 @@ S.COMMANDS = {
 		title = "Run automation now",
 		icon = "rocket",
 		run = function(cx)
-			S.auto_pick(cx, "Automation to run now", S.auto_run)
+			when(cx, function(c)
+				S.auto_pick(c, "Automation to run now", S.auto_run)
+			end)
 		end,
 	},
-	{ id = "options", title = "Workspace options", icon = "sliders", run = S.options },
-	{ id = "settings", title = "Sidebar settings", icon = "gear", run = S.settings_picker },
+	{ id = "options", title = "Workspace options", icon = "sliders", run = call("options") },
+	{ id = "settings", title = "Sidebar settings", icon = "gear", run = call("settings_picker") },
 	{
 		id = "use_orca_keys",
 		title = "Use Orca shortcuts",
 		icon = "settings",
 		available = function(cx)
-			return not S.orca_keys_bound(cx)
+			return H ~= nil and not S.orca_keys_bound(cx)
 		end,
-		run = S.use_orca_keys,
+		run = call("use_orca_keys"),
 	},
 	{
 		id = "release_orca_keys",
 		title = "Release Orca shortcuts (back to Tern's)",
 		icon = "settings",
-		available = S.orca_keys_bound,
-		run = S.release_orca_keys,
+		available = function(cx)
+			return H ~= nil and S.orca_keys_bound(cx)
+		end,
+		run = call("release_orca_keys"),
 	},
 }
 
-function S.register_commands()
-	for _, def in S.COMMANDS do
+local function register_commands()
+	for _, def in COMMANDS do
 		def.group = "Projects"
 		tern.command(def)
 	end
 end
-S.register_commands()
+register_commands()
 
 -- The title bar's Files button (moved to the leading edge by chrome.css) and ⌃⌘E toggle the sidebar.
 -- Files stays on ⇧⌘E (focus_files) and the sidebar settings.
 tern.override("files", function(cx: WindowCx): boolean?
-	S.toggle_side(cx)
+	when(cx, function(c)
+		S.toggle_side(c)
+	end)
 	return true
 end)
 
--- Events ------------------------------------------------------------------------------------
-
-local function project_arg(value: string?): model.Project?
-	return if value then model.get(model.load(), value) else nil
-end
+-- Events (events.luau) --------------------------------------------------------------------
 
 tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
+	if H then
+		return H.canvas_action(ev, cx)
+	end
 	if ev.owner ~= ID then
 		return false
 	end
-	-- A click focused the sidebar: give focus back first (synchronously, so it never shows).
-	S.refocus(cx, ev.pane)
-	-- Real clicks arrive split at `=` (act, value); scripted events arrive whole: parse_action takes both.
-	local act, parsed = sidebar.parse_action(ev)
-	local pane = if type(parsed) == "number" then parsed else nil
-	local value = if type(parsed) == "string" then parsed else nil
-	local alt = ev.mods ~= nil and table.find(ev.mods, "alt") ~= nil
-	if pane then
-		if act == "fleet_focus" then
-			S.fleet_focus(cx, pane)
-		elseif act == "focus" then
-			if pane < 0 then
-				S.wake(cx, pane)
-			else
-				S.goto_pane(cx, pane)
-				S.redraw_soon()
-			end
-		elseif act == "wake" then
-			S.wake(cx, pane)
-		elseif act == "rename" then
-			S.rename_agent(cx, pane)
-		elseif act == "new_subagent" then
-			S.new_subagent_of(cx, pane)
-		elseif act == "sleep" then
-			S.sleep_agent(cx, pane)
-		elseif act == "delete" then
-			S.delete_agent(cx, pane)
-		elseif act == "toggle_unread" then
-			S.toggle_unread(cx, pane)
-		elseif act == "toggle_pin" then
-			S.toggle_pin(cx, pane)
-		elseif act == "copy_path" then
-			S.copy_path(cx, pane)
-		elseif act == "copy_name" then
-			S.copy_name(cx, pane)
-		elseif act == "open_finder" then
-			S.open_in_finder(cx, S.cwd_of(pane))
-		elseif act == "toggle_kids" then
-			S.expanded[pane] = if S.expanded[pane] then nil else true
-			S.refresh_side(cx)
-		elseif act == "toggle_idle" then
-			S.idle_open[pane] = if S.idle_open[pane] then nil else true
-			S.refresh_side(cx)
-		else
-			return false
-		end
-		return true
-	end
-	if act == "fleet_group" and value then
-		S.fleet_group(cx, value)
-	elseif act == "open_url" and value then
-		S.open_url(cx, value)
-	elseif act == "gh_refresh" and value then
-		S.gh_refresh(cx, value)
-	elseif act == "toggle_prs" and value then
-		S.toggle_prs(cx, value)
-	elseif act == "auto_run" and value then
-		S.auto_run(cx, value)
-	elseif act == "auto_toggle" and value then
-		S.auto_toggle(cx, value)
-	elseif act == "auto_open" and value then
-		S.auto_open(cx, value)
-	elseif act == "auto_runs" and value then
-		S.auto_runs(cx, value)
-	elseif act == "auto_new" then
-		S.auto_new(cx)
-	elseif act == "auto_edit" then
-		S.auto_edit(cx)
-	elseif act == "new_agent" then
-		S.new_agent_for(cx, value)
-	elseif act == "toggle_group" and value then
-		if alt then
-			S.collapse_all(cx)
-		else
-			S.toggle_group(cx, value)
-		end
-	elseif act == "open_project" and project_arg(value) then
-		S.open_project(cx, project_arg(value) :: model.Project)
-	elseif act == "remove_project" and project_arg(value) then
-		S.confirm_remove(cx, project_arg(value) :: model.Project)
-	elseif act == "project_menu" and value then
-		S.project_menu(cx, value)
-	elseif act == "project_settings" and value then
-		S.project_settings(cx, value)
-	elseif act == "project_icon" and value then
-		S.project_icon(cx, value)
-	elseif act == "new_group" and value then
-		S.new_group(cx, value)
-	elseif act == "move_to_group" and value then
-		S.move_to_group(cx, value)
-	elseif act == "ungroup" and value then
-		S.ungroup(cx, value)
-	elseif act == "group_menu" and value then
-		S.group_menu(cx, value)
-	elseif act == "rename_group" and value then
-		S.rename_group(cx, value)
-	elseif act == "delete_group" and value then
-		S.delete_group(cx, value)
-	elseif act == "collapse_all" then
-		S.collapse_all(cx)
-	elseif act == "add_project" then
-		S.add_project(cx)
-	elseif act == "search" then
-		S.search(cx)
-	elseif act == "activity" then
-		S.toggle_activity(cx)
-	elseif act == "options" then
-		S.options(cx)
-	elseif act == "settings" then
-		S.settings_picker(cx)
-	elseif act == "help" then
-		S.help_picker(cx)
-	elseif act == "reveal" then
-		S.reveal_active(cx)
-	else
-		return false
-	end
+	table.insert(queued, function(c)
+		H.canvas_action(ev, c)
+	end)
 	return true
 end)
 
--- An agent the user isn't looking at that finished or needs input is unread until focused or marked read.
-local function mark_unread(cx: WindowCx, pane: number)
-	if S.main_pane(cx, S.side_pane) ~= pane then
-		S.set_unread(core.key_of(pane), true)
-	end
-end
-
-local function who(pane: number): string
-	local b = S.blocks[pane]
-	local cwd = if b then b.cwd else nil
-	local p = S.project_of(pane, cwd)
-	return (if p then p.name .. " · " else "") .. S.title_of(pane, cwd)
-end
-
-local function last_line(pane: number): string?
-	local b = S.blocks[pane]
-	return if b and b.last_message then short(firstline(b.last_message :: string), 120) else nil
-end
-
--- Event hooks stay small (budget.luau): they note what happened from the last scan's cache and leave the scan,
--- reads and drawing to labelled timer callbacks (`S.changed`).
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
-	S.last_activity[ev.pane] = os.time()
-	local b = S.blocks[ev.pane]
-	if b then
-		b.state = ev.new
-	end
-	if ev.new == "working" then
-		S.results[ev.pane] = nil
-		S.prompt_stale[ev.pane] = true
-	end
-	if ev.new == "waiting_input" and ev.old ~= "waiting_input" and S.main_pane(cx, S.side_pane) ~= ev.pane then
-		mark_unread(cx, ev.pane)
-		cx:toast("info", who(ev.pane) .. " needs input", last_line(ev.pane))
-	end
-	S.mail_state(ev.pane, ev.old, ev.new)
-	S.auto_state(ev.pane, ev.new)
-	S.changed(cx)
+	when(cx, function(c)
+		H.agent_state(ev, c)
+	end)
 end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
-	if ev.result ~= "done" and ev.result ~= "failed" then
-		S.changed(cx)
-		return
-	end
-	S.auto_finished(ev.pane, ev.result)
-	local t = os.time()
-	S.results[ev.pane] = { result = ev.result, at = t }
-	S.last_activity[ev.pane] = t
-	local meta = S.meta_of(ev.pane)
-	-- A spawned subagent's result goes to its parent, which reports it (Orca's coordinator rule).
-	local reports = meta ~= nil and meta.parent ~= nil and meta.report_back ~= false
-	if S.main_pane(cx, S.side_pane) ~= ev.pane then
-		mark_unread(cx, ev.pane)
-		if not reports then
-			if ev.result == "done" then
-				cx:toast("success", who(ev.pane) .. " finished", last_line(ev.pane))
-			else
-				cx:toast("error", who(ev.pane) .. " failed", last_line(ev.pane))
-			end
-		end
-	end
-	if reports then
-		budget.later("report_back", 0, function(dcx)
-			S.report_back(dcx, ev.pane, ev.result, 0)
-		end)
-	end
-	S.changed(cx)
+	when(cx, function(c)
+		H.agent_finished(ev, c)
+	end)
 end)
 
 tern.on("budget", function(ev: BudgetEvent, _cx: WindowCx)
 	tern.log.warn(budget.describe(ev))
 end)
 
--- Focus moved: the focused agent is read, and the sidebar follows the user to another tab or session.
 tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
-	local side = S.find_side(cx)
-	if ev.pane == side then
-		-- Focus lands on the sidebar when it is left alone in its tab.
-		S.rehome_side(cx)
-		return
-	end
-	S.last_main = ev.pane
-	S.fleet_focused(ev.pane)
-	S.clear_unread(if S.card_pane(ev.pane) == ev.pane then S.unread_keys(ev.pane) else { core.key_of(ev.pane) })
-	-- (Parked while shown: it waited for a tab with a pane to work in.)
-	if side and S.ui.visible and (S.parked(cx, side) or cx.session:tab_of(side) ~= ev.tab) then
-		S.show_side(cx)
-	end
-	S.redraw_soon()
+	when(cx, function(c)
+		H.focus(ev, c)
+	end)
 end)
 
-tern.on("pane_created", function(_ev: PaneEvent, _cx: WindowCx)
-	S.layout_dirty = true
+tern.on("pane_created", function(ev: PaneEvent, cx: WindowCx)
+	when(cx, function(c)
+		H.pane_created(ev, c)
+	end)
 end)
 
 tern.on("cwd", function(ev: CwdEvent, cx: WindowCx)
-	if S.blocks[ev.pane] then
-		S.changed(cx)
-	end
+	when(cx, function(c)
+		H.cwd(ev, c)
+	end)
 end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
-	if ev.pane == S.side_pane then
-		S.side_pane = nil
-		S.fitted = nil
-		S.side_gen += 1
-		return
-	end
-	S.layout_dirty = true
-	if ev.pane == S.last_main then
-		S.last_main = nil
-	end
-	S.state = model.load()
-	local key = core.key_of(ev.pane)
-	local meta = S.state.agents[key]
-	if meta and meta.worktree and meta.parent == nil then
-		-- It sleeps as a card: its pin and unread mark stay, and whether it was cut off mid-turn persists.
-		meta.closed = true
-		meta.closed_at = os.time()
-		meta.interrupted = if S.interrupted[key] then true else nil
-		model.save(S.state)
-	else
-		if meta then
-			S.state.agents[key] = nil
-			model.save(S.state)
-		end
-		S.ui = model.load_ui()
-		if S.ui.pinned[key] or S.ui.unread[key] then
-			S.ui.pinned[key], S.ui.unread[key] = nil, nil
-			S.save_ui()
-		end
-	end
-	S.pane_key[ev.pane] = nil
-	S.interrupted[key] = nil
-	S.reported[ev.pane] = nil
-	S.changed(cx)
-	-- The layout may still hold the closed pane: then look again on the next turn.
-	if not S.rehome_side(cx) then
-		defer(function(dcx)
-			S.rehome_side(dcx)
-		end)
-	end
-end)
-
-tern.on("session_ended", function(_ev: SessionEndedEvent, cx: WindowCx)
-	S.changed(cx)
-end)
-
--- Once per plugin run: at window_start, or (after a reload, which runs no window_start) on the first timer.
-local started = false
-local function init(cx: WindowCx)
-	if started then
-		return
-	end
-	started = true
-	S.ui = model.load_ui()
-	S.state = model.load()
-	if model.migrate_ui(S.ui, S.state) then
-		S.save_ui()
-	end
-	S.mail_start()
-	S.changed(cx)
-	-- A plugin load, reload or window relaunch never opens a sidebar: it takes up the one that exists (closing any
-	-- extra), once the canvas replica has caught up, and only the user's toggle opens a new one.
-	budget.later("adopt sidebar", 1500, function(acx)
-		local side = S.find_side(acx)
-		if side == nil then
-			return
-		end
-		if S.ui.visible then
-			S.show_side(acx)
-		elseif not S.parked(acx, side) then
-			-- Shown by an earlier run that didn't persist it: keep it live.
-			S.redraw_soon()
-			S.start_ticker()
-		end
+	when(cx, function(c)
+		H.pane_closed(ev, c)
 	end)
-	-- A relaunched window can list another canvas late: look again once.
-	budget.later("dedupe sidebar", 6000, S.dedupe_side)
-end
-
-tern.on("window_start", init)
-
-tern.timer(0, function(cx)
-	if cx then
-		init(cx)
-	end
 end)
 
--- Pure: reads only the caches `scan` fills, which calls tern.chrome.refresh() on change.
--- Always shows one segment, so the sidebar is one click away from any pane: the focused
--- pane's project with its counts, else "Projects" with the waiting count across all projects.
-local function status_segments(pane: StatusPaneInfo): { StatusSegment }?
-	local id = S.pane_project[pane.pane]
-	local p = if id then model.get(S.state, id) else model.project_for_path(S.state, pane.cwd)
-	if p == nil then
-		local waiting = 0
-		for _, c in S.counts do
-			waiting += c.waiting
-		end
-		return {
-			{
-				text = if waiting > 0 then string.format("Projects · %d waiting", waiting) else "Projects",
-				icon = "sidebar",
-				tone = if waiting > 0 then "warn" else nil,
-				command = TOGGLE,
-			},
-		}
-	end
-	local c = S.counts[p.id] or { working = 0, waiting = 0 }
-	return {
-		{
-			text = string.format("%s · %d working · %d waiting", p.name, c.working, c.waiting),
-			icon = "sidebar",
-			tone = if c.waiting > 0 then "warn" else nil,
-			command = TOGGLE,
-		},
-	}
-end
+tern.on("session_ended", function(ev: SessionEndedEvent, cx: WindowCx)
+	when(cx, function(c)
+		H.session_ended(ev, c)
+	end)
+end)
 
-tern.chrome.status(status_segments)
+-- Until loaded, the status segment is the plain sidebar toggle `H.status` shows outside a project.
+tern.chrome.status(function(pane: StatusPaneInfo): { StatusSegment }?
+	if H then
+		return H.status(pane)
+	end
+	return { { text = "Projects", icon = "sidebar", command = base.TOGGLE } }
+end)
+
+-- Staged loading --------------------------------------------------------------------------
+
+-- One module compiled per timer callback, dependencies first, so each `require` compiles one file (a module
+-- already loaded is cached). The largest take 35-125 ms of wall time (sidebar, snapshot, agents), against 500.
+local STAGES: { { label: string, run: (cx: WindowCx) -> () } } = {
+	{ label = "load model", run = function() require("./model") end },
+	{ label = "load identity", run = function() require("./identity") end },
+	{ label = "load subagents", run = function() require("./subagents") end },
+	{ label = "load core", run = function() require("./core") end },
+	{ label = "load gh", run = function() require("./gh") end },
+	{ label = "load sidebar", run = function() require("./sidebar") end },
+	{ label = "load placement", run = function() require("./placement") end },
+	{ label = "load snapshot", run = function() require("./snapshot") end },
+	{ label = "load agents", run = function() require("./agents") end },
+	{ label = "load projects", run = function() require("./projects") end },
+	{ label = "load pickers", run = function() require("./pickers") end },
+	{ label = "load mailq", run = function() require("./mailq") end },
+	{ label = "load mail", run = function() require("./mail") end },
+	{ label = "load fleet", run = function() require("./fleet") end },
+	{ label = "load fleets", run = function() require("./fleets") end },
+	{ label = "load prs", run = function() require("./prs") end },
+	{ label = "load sched", run = function() require("./sched") end },
+	{ label = "load autowin", run = function() require("./autowin") end },
+	{ label = "load events", run = function() require("./events") end },
+}
+-- The stages above compile a module each; their callbacks are logged as slow only past SLOW_LOAD_MS.
+local MODULE_STAGES = #STAGES
+
+-- Then the context table and every installer (all compiled by now), `init`, and the hooks queued until then.
+local handlers: any = nil
+table.insert(STAGES, {
+	label = "load start",
+	run = function(_cx)
+		S = require("./core").new()
+		require("./placement")(S)
+		require("./snapshot")(S)
+		require("./agents")(S)
+		require("./projects")(S)
+		require("./pickers")(S)
+		require("./mail")(S)
+		require("./fleets")(S)
+		require("./prs")(S)
+		require("./autowin")(S)
+		S.COMMANDS = COMMANDS
+		S.register_commands = register_commands
+		handlers = require("./events")(S)
+	end,
+})
+table.insert(STAGES, {
+	label = "init",
+	run = function(cx)
+		-- From here hooks run directly.
+		H = handlers
+		handlers.init(cx)
+		tern.chrome.refresh()
+	end,
+})
+table.insert(STAGES, {
+	label = "queued hooks",
+	run = function(cx)
+		local fns = queued
+		queued = {}
+		for _, fn in fns do
+			fn(cx)
+		end
+	end,
+})
+
+-- Stages run so far, and whether one failed (budget.run logs its error; the rest don't run).
+local done = 0
+local broken = false
+
+-- Runs the next stage, labelled. Every stage's timer starts at load, `i` ms out, so they run in order and several
+-- per turn, each in a callback of its own (its own budget); a stage starting the next would wait a turn each, about
+-- a second when the window is idle.
+local function advance(cx: WindowCx?)
+	if broken or done >= #STAGES then
+		return
+	end
+	if cx == nil then
+		tern.timer(0, advance)
+		return
+	end
+	done += 1
+	local s = STAGES[done]
+	local ok = false
+	budget.run(s.label, function(rcx: WindowCx)
+		s.run(rcx)
+		ok = true
+	end, cx, if done <= MODULE_STAGES then budget.SLOW_LOAD_MS else nil)
+	broken = not ok
+end
+for i = 1, #STAGES do
+	tern.timer(i, advance)
+end
