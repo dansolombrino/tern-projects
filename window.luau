@@ -30,6 +30,7 @@ require("./pickers")(S)
 require("./mail")(S)
 require("./fleets")(S)
 require("./prs")(S)
+require("./autowin")(S)
 
 -- Commands --------------------------------------------------------------------------------
 
@@ -83,6 +84,24 @@ S.COMMANDS = {
 	{ id = "reveal", title = "Reveal active workspace", icon = "search", run = S.reveal_active },
 	{ id = "cleanup", title = "Delete a sleeping workspace", icon = "trash", run = S.cleanup },
 	{ id = "create_pr", title = "Create pull request for focused worktree", icon = "branch", run = S.create_pr },
+	{ id = "new_automation", title = "New automation", icon = "sparkle", run = S.auto_new },
+	{ id = "edit_automations", title = "Edit automations (automations.json)", icon = "doc", run = S.auto_edit },
+	{
+		id = "automation_runs",
+		title = "Automation runs",
+		icon = "list",
+		run = function(cx)
+			S.auto_pick(cx, "Automation", S.auto_runs)
+		end,
+	},
+	{
+		id = "run_automation",
+		title = "Run automation now",
+		icon = "rocket",
+		run = function(cx)
+			S.auto_pick(cx, "Automation to run now", S.auto_run)
+		end,
+	},
 	{ id = "options", title = "Workspace options", icon = "sliders", run = S.options },
 	{ id = "settings", title = "Sidebar settings", icon = "gear", run = S.settings_picker },
 	{
@@ -184,6 +203,18 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 		S.gh_refresh(cx, value)
 	elseif act == "toggle_prs" and value then
 		S.toggle_prs(cx, value)
+	elseif act == "auto_run" and value then
+		S.auto_run(cx, value)
+	elseif act == "auto_toggle" and value then
+		S.auto_toggle(cx, value)
+	elseif act == "auto_open" and value then
+		S.auto_open(cx, value)
+	elseif act == "auto_runs" and value then
+		S.auto_runs(cx, value)
+	elseif act == "auto_new" then
+		S.auto_new(cx)
+	elseif act == "auto_edit" then
+		S.auto_edit(cx)
 	elseif act == "new_agent" then
 		S.new_agent_for(cx, value)
 	elseif act == "toggle_group" and value then
@@ -272,6 +303,7 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 		cx:toast("info", who(ev.pane) .. " needs input", last_line(ev.pane))
 	end
 	S.mail_state(ev.pane, ev.old, ev.new)
+	S.auto_state(ev.pane, ev.new)
 	S.changed(cx)
 end)
 
@@ -280,6 +312,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		S.changed(cx)
 		return
 	end
+	S.auto_finished(ev.pane, ev.result)
 	local t = os.time()
 	S.results[ev.pane] = { result = ev.result, at = t }
 	S.last_activity[ev.pane] = t

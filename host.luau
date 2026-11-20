@@ -10,12 +10,14 @@
 --   not in a window), written to `<data>/status.json` for the window halves to read.
 -- - GitHub (ghpoll.luau): the PRs and issues of every project's repository and the PR of every branch a card shows,
 --   read with `gh` on a rate-limited clock and written to `<data>/gh.json`.
+-- - Automations (autohost.luau): the scheduler of Orca-style automations, its headless runs and history.
 
 local mailq = require("./mailq")
 local model = require("./model")
 local identity = require("./identity")
 local fleet = require("./fleet")
 local ghpoll = require("./ghpoll")
+local autohost = require("./autohost")
 
 local DATA = tern.plugin.data
 local SPOOL = DATA .. "/spool"
@@ -36,6 +38,8 @@ local REPO_TTL = 15
 local SPOOL_TRIES = 10
 -- The GitHub clock (ghpoll.luau keeps each repository's own pace).
 local GH_MS = 5000
+-- The automations' scheduler clock (schedules are whole minutes; runs end by their status files).
+local AUTO_MS = 2000
 
 pcall(tern.fs.mkdir, SPOOL)
 
@@ -209,6 +213,8 @@ local function apply_spool()
 					changed = changed or c
 				elseif obj.op == "ack" then
 					changed = mailq.apply(box, obj, now) or changed
+				elseif type(obj.op) == "string" and string.sub(obj.op, 1, 5) == "auto_" then
+					autohost.spool(obj)
 				else
 					ghpoll.spool(obj)
 				end
@@ -285,6 +291,8 @@ end
 
 -- Panes from `tern inspect --json` (it names each pane's omp session file; `tern.pane.list` does not).
 local inspecting = false
+-- The first poll came back (until then nothing is known to be gone).
+local polled = false
 local function poll_panes()
 	if inspecting then
 		return
@@ -310,6 +318,7 @@ local function poll_panes()
 			end
 		end
 		panes = fresh
+		polled = true
 		live = fleet.live_of(doc)
 	end)
 	if not ok then
@@ -437,6 +446,9 @@ local function write_status()
 	for k, v in ghpoll.stats() do
 		doc[k] = v
 	end
+	for k, v in autohost.stats() do
+		doc[k] = v
+	end
 	pcall(tern.fs.write, STATUS, tern.json.encode(doc))
 end
 
@@ -502,6 +514,28 @@ ghpoll.start({
 	end,
 })
 every(GH_MS, "github", ghpoll.tick)
+
+autohost.start({
+	notify = notify,
+	panes = function(): { [number]: boolean }?
+		if not polled then
+			return nil
+		end
+		local out: { [number]: boolean } = {}
+		for pane in panes do
+			out[pane] = true
+		end
+		return out
+	end,
+	projects = function(): { any }
+		local out = {}
+		for _, p in model.load().projects do
+			table.insert(out, { id = p.id, name = p.name, root = p.root })
+		end
+		return out
+	end,
+})
+every(AUTO_MS, "automations", autohost.tick)
 
 poll_panes()
 start_helper()

@@ -718,3 +718,35 @@ html[data-theme='dark'] .op-g-folder-tree { background-image: url("data:image/sv
 .op-ghrow-m { flex-shrink: 0; font-size: 10px; color: var(--op-question); }
 .op-ghmore, .op-ghnone { color: var(--op-muted60); }
 .op-ghnone { cursor: default; }
+
+/* Automations (README "Automations"): one two-line row per automation, below the projects. */
+.op-autos .op-ghnone { cursor: pointer; }
+.op-auto {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	min-width: 0;
+	padding: 5px 6px 5px 22px;
+	border-radius: 6px;
+	cursor: pointer;
+}
+.op-auto:hover { background: light-dark(rgba(10, 10, 10, .04), rgba(38, 38, 38, .4)); }
+.op-auto-top, .op-auto-last { display: flex; align-items: center; gap: 6px; min-width: 0; line-height: 1.2; }
+.op-auto-n { flex: 0 1 auto; min-width: 24px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 500; color: var(--op-fg80); }
+.op-auto-s { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; color: var(--op-muted60); }
+.op-auto-l { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; color: var(--op-muted90); }
+/* Hover actions take no room until shown: the sidebar can be narrow. */
+.op-auto-acts { display: none; align-items: center; gap: 2px; flex-shrink: 0; }
+.op-auto:hover .op-auto-acts { display: flex; }
+.op-auto.op-off .op-auto-n { color: var(--op-muted70); }
+.op-auto.op-off .op-auto-s { font-style: italic; }
+.op-auto.op-run .op-auto-l { color: var(--op-fg80); }
+.op-auto .op-inactive .op-dot { width: 6px; height: 6px; border: 1px solid var(--op-muted60); background: transparent; }
+.op-auto-err {
+	display: flex;
+	align-items: center;
+	min-width: 0;
+	padding: 2px 6px 2px 22px;
+	font-size: 10px;
+	color: var(--op-question);
+}

@@ -412,6 +412,7 @@ local function snapshot(cx: WindowCx): any
 		end)(),
 		waiting = waiting,
 		fleets = S.fleet_snap(S.main_pane(cx, S.side_pane)),
+		autos = S.auto_snap(),
 	}
 end
 

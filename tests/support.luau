@@ -139,4 +139,38 @@ function support.find(root: any, root_id: string, id: string): any
 	return found
 end
 
+-- A JSON encoder for fixtures and round trips: tables with a [1] are arrays, the rest objects (keys sorted).
+function support.encode_json(x: any): string
+	local ty = type(x)
+	if ty == "string" then
+		return '"' .. string.gsub(x, '[%c\\"]', function(c: string): string
+			local named = { ['"'] = '\\"', ["\\"] = "\\\\", ["\n"] = "\\n", ["\t"] = "\\t", ["\r"] = "\\r" }
+			return named[c] or string.format("\\u%04x", string.byte(c))
+		end) .. '"'
+	elseif ty == "number" or ty == "boolean" then
+		return tostring(x)
+	elseif x == nil then
+		return "null"
+	elseif ty == "table" then
+		if x[1] ~= nil then
+			local parts = {}
+			for _, v in x do
+				table.insert(parts, support.encode_json(v))
+			end
+			return "[" .. table.concat(parts, ",") .. "]"
+		end
+		local keys = {}
+		for k in x do
+			table.insert(keys, tostring(k))
+		end
+		table.sort(keys)
+		local parts = {}
+		for _, k in keys do
+			table.insert(parts, support.encode_json(k) .. ":" .. support.encode_json(x[k]))
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	error("cannot encode " .. ty)
+end
+
 return support

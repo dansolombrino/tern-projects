@@ -147,6 +147,120 @@ Settings, in kv key `projects.gh.v1` (no UI): `{"path": "/opt/homebrew/bin/gh"}`
 `gh` on the daemon's `PATH`), `{"off": true}` stops all GitHub calls. `gh` keeps its own token; the plugin never reads,
 stores or logs one (error lines are cut to their first line with anything token-shaped masked).
 
+### Automations
+
+Orca's automations (`orca automations …`, the desktop Automations page): an agent prompt that runs on a schedule in
+a project or folder, with run history, enable/disable and Run now. The **Automations** section sits below the projects.
+
+- **Header**: the count (`2 · 1 running`), `…` opens `automations.json`, `+` adds one; a click collapses it.
+- **Row** per automation: its name, `next in 4m` (or `next 14:30`, `next Tue 09:00`, `paused`) and the schedule; then
+  the active run (`Queued`, `Precheck`, `Starting`, `Running`) or the latest finished one (`Done: <first line of the
+  answer>`, `Failed: …`, `Timed out`, `Missed ×12`, `Skipped (busy)`, `Skipped (precheck)`, `Canceled`, `Lost`) with
+  its age. Hover: `▶` Run now, `⏸`/`⏵` pause or enable, `↗` open the latest output. A click lists its runs (open one,
+  stop a running one); right-click: Run now, Pause/Enable, Open latest output, Runs…, Edit automations.json.
+- Problems in the file show as amber lines at the top of the section (the entry is left out, the rest run).
+- Palette: **New automation** (name, schedule, prompt, where, how), **Edit automations (automations.json)**,
+  **Automation runs**, **Run automation now**.
+
+**Definitions** are a JSON file you edit, `<data>/automations.json` (`<data>` is the plugin's data dir, see *Fleet
+mailbox*); the palette's New automation and the pause switch write it too (pretty-printed, keys in a fixed order,
+unknown keys kept). A file that is not valid JSON keeps the last good definitions and says so in the section.
+
+```json
+{
+  "version": 1,
+  "max_concurrent": 2,
+  "automations": [
+    {
+      "id": "nightly-review",
+      "name": "Nightly review",
+      "enabled": true,
+      "schedule": "weekdays 18:00",
+      "run_in": "headless",
+      "project": "app",
+      "prompt": "Review today's commits on main and list anything risky.",
+      "model": "sonnet",
+      "missed": "run_once",
+      "grace_minutes": 120,
+      "timeout_minutes": 30,
+      "precheck": "git log --since=today --oneline | grep -q ."
+    }
+  ]
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `id` | Stable id (letters, digits, `-`, `_`); default: a slug of `name`. Runs are `<id>-<n>`. |
+| `name` | Required. |
+| `enabled` | Default `true`. A paused automation keeps its history; enabling it schedules from now on (nothing for the paused time). |
+| `schedule` | `every 2m`, `every 90m`, `every 2h` (absolute: counted from the Unix epoch, so `every 2m` is every even minute); `hourly`, `hourly :15`; `daily 09:00`; `weekdays 09:00`; `weekly mon 09:00` (or `0`-`6`, Sunday `0`); or 5-field cron (`0 9 * * 1-5`: lists, ranges, steps, month and day names, `7` = Sunday; with both day fields restricted either matches, as in Vixie cron). A schedule that never comes (`0 0 31 2 *`) is refused. |
+| `project` or `cwd` | Where it runs: a project (id or name; its root) or an absolute folder (`~` allowed). |
+| `run_in` | `headless` (default): `omp -p` as a process, output saved. `pane`: an agent tab, see below. |
+| `prompt` | Required: the first (and only) prompt. |
+| `model` | Optional `--model` (`omp --model <m>` for a pane run). |
+| `args` | Optional extra `omp` arguments for headless runs, e.g. `["--thinking", "low"]`. |
+| `missed` | `run_once` (default): occurrences missed while Tern was not running (or the Mac slept) run once at the next start, as a `catchup` run. `skip`: they are recorded as one `Missed ×N` row. |
+| `grace_minutes` | With `run_once`: catch up only when the latest missed occurrence is at most this old (Orca's missed-run grace); default: any age. |
+| `timeout_minutes` | Default 30. Headless: `omp --max-time`, killed 2 min after that. Pane: the run is marked `Timed out` and the agent keeps its pane. |
+| `precheck` | Optional shell command run in the folder before a *scheduled* run (not Run now, as in Orca); exit 0 runs, anything else is `Skipped (precheck)`. `precheck_timeout` (s, default 60). |
+| `max_concurrent` | Top level: runs at once across all automations (default 2, at most 8). |
+
+**Scheduling** (`sched.luau`, `automate.luau`, `autohost.luau`). The host half owns the schedules: its 2 s clock runs
+in Tern's daemon with no window open. Wall-clock schedules follow the daemon's local zone. Daylight saving: a time
+the spring-forward gap skips does not occur that day (`daily 02:30` skips it); a time the fall-back hour repeats
+runs once, at the first instant. An occurrence is on time up to 90 s late; later it was missed and `missed` decides.
+Only the latest missed occurrence ever runs, whatever the count. One run at a time per automation (Orca's lane): an
+occurrence due while the previous run is active is `Skipped (busy)` (consecutive skips fold into one row, `×N`).
+Runs over the `max_concurrent` cap wait `Queued` (precheck, starting and running runs hold a slot).
+
+**Headless runs** run `omp -p --max-time <s> [--model m] [args] <prompt>` in the folder, through a small `sh` wrapper
+(stdin closed) started with `tern.process.run`: the answer goes to `<data>/autoruns/<run>.md` (after a header naming
+the run), stderr to `<run>.err`, the agent's pid to `<run>.pid` and its exit code to `<run>.status`. The status file
+ends the run, so a run outliving a plugin reload or a daemon upgrade still ends right; one whose process is gone
+with no status file (a daemon restart) is `Lost`. Exit 0 is `Done` with the answer's first line as its summary;
+anything else `Failed` with the error's last line (exit 3: the cost limit).
+
+**Pane runs** need a window (`cx.agents` exists only there). The host marks the run `Starting` and wakes the windows;
+the window that delivers mail (the mailbox's leader) starts the agent with `cx.agents:start` in the project's session
+(a folder's go to an **Automations** session), as a tab named `⏱ <name> #<n>`, without taking your view: it starts in
+the current session, moves to its own (`move_to_new_tab`, no focus) and gives focus back. A session made for it
+loses its first shell. The run ends when the agent's turn ends (`agent_finished`, or the leader seeing it idle
+after it worked), with its last answer as the summary. With no window within 20 s the run goes headless instead
+(`no Tern window: ran headless`). An automation keeps the pane of its latest run; older finished ones close when the
+next starts (Orca's terminal retention), unless focused or working.
+
+**History**: the last 50 finished runs per automation (Orca keeps 100; each kv write rewrites the whole history),
+active ones always; removing an automation from the file cancels its queued runs and drops its history and output
+files. State is in kv `automations.v1`, written by the host half only; windows send requests through
+`<data>/spool/` (`auto_run`, `auto_enable`, `auto_create`, `auto_started`, `auto_finished`, `auto_stop`, …) and read
+`<data>/autos.json` when `auto_sig` changes (status.json, and the tiny `<data>/autos.sig` they check on each mailbox
+watcher line). status.json also reports `auto_ms`/`auto_ms_max`, the scheduler tick's last and longest time.
+
+What maps to Orca, and what doesn't:
+
+| Orca | Here |
+|---|---|
+| `automations create/edit/remove`, desktop editor | `automations.json` (edit it, or New automation); remove = delete the entry |
+| `automations list/show`, the Automations page | the sidebar section and its runs picker |
+| `automations run` (Run now, bypasses the precheck) | `▶`, Run automation now (bypasses the precheck too) |
+| `--enabled/--disabled` | `enabled`, the `⏸`/`⏵` switch |
+| `--trigger` presets, 5-field cron | the same presets and cron, plus `every N m/h` |
+| `--trigger` RRULE | not supported (cron covers the presets) |
+| `--timezone <IANA>` | not supported: the daemon's local zone (Luau has no zone database) |
+| `--missed-run-grace-minutes`, `run_once_within_grace` | `grace_minutes` with `missed: run_once`; plus `missed: skip` |
+| `--precheck`, `--precheck-timeout`, `skipped_precheck` | `precheck`, `precheck_timeout`, `Skipped (precheck)` |
+| `--provider <agent>`, `--extra-agent-args` | omp only; `model`, `args` |
+| `--workspace` (existing worktree) | `project` (its root) or `cwd` |
+| `--repo` / `--workspace-mode new-per-run` (a worktree per run), `--setup`, `--base-branch` | not supported: runs share the folder (worktrees per run would pile up with every-few-minutes schedules) |
+| `--reuse-session` | not supported: every run is a fresh agent; the latest run's pane is kept |
+| run history (100 per automation), statuses | 50 per automation; Done, Failed, Timed out, Missed, Skipped (busy, precheck), Canceled, Lost |
+| one dispatch lane per automation | one active run per automation (`Skipped (busy)`) |
+| bot automations, event triggers (`--on slack.mentioned`, `github.ci_failed`, …), `--once` waits, results to Slack/Linear | not supported: no connectors in Tern |
+| remote hosts (`--host`, SSH, paired servers) | this machine only |
+| usage (tokens) per run | not shown (the pane shows omp's own; headless output has the answer only) |
+| (Orca needs its window open: #7270) | the host half schedules with no window; a pane run goes headless when no window is open |
+
 ### Activity view
 
 The bell swaps the list for every agent, grouped by status (Needs you, Working, Done, Idle), each
@@ -180,6 +294,10 @@ Windows the chords use `Ctrl` instead of `⌘`.
 | Reveal active workspace | `reveal` | | |
 | Delete a sleeping workspace | `cleanup` | | |
 | Create pull request for focused worktree | `create_pr` | | |
+| New automation | `new_automation` | | |
+| Edit automations (automations.json) | `edit_automations` | | |
+| Automation runs | `automation_runs` | | |
+| Run automation now | `run_automation` | | |
 | Workspace options | `options` | | |
 | Sidebar settings | `settings` | | |
 | Use Orca shortcuts | `use_orca_keys` | | |
@@ -242,6 +360,11 @@ The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` h
 - GitHub output is parsed by the host half (gh.luau, on its 5 s clock); a window re-reads the compact `<data>/gh.json`
   only when `gh_sig` in status.json changed, in a timer callback of its own (logged when over 25 ms), and a change
   redraws only the sections it touches (a project's section, a fleet).
+- Automations are scheduled by the host half (2 s clock; a tick re-reads `automations.json` only when its text
+  changed, and takes well under 1 ms with a few automations: `auto_ms` in status.json). A window reads the small
+  `autos.sig` on each mailbox watcher line (about every 3 s) and `autos.json` only when it changed, in a callback of
+  its own; the leader starts at most one pane run per callback, and checks running pane runs (one
+  `cx.agents:list()`) only while some run. The section is one list part, so a change redraws only it.
 
 ## Fleet mailbox
 
@@ -343,12 +466,16 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
   close (a restart that did not bring it back).
 
 The fleet mailbox is under `mailbox.v1` (written by the host half only). GitHub settings are under
-`projects.gh.v1` (see *Pull requests and issues*); the GitHub data itself is in `<data>/gh.json`, not kv.
+`projects.gh.v1` (see *Pull requests and issues*); the GitHub data itself is in `<data>/gh.json`, not kv. Automation
+state (each automation's next run and run counter, the run history) is under `automations.v1` (written by the host
+half only); the definitions are `<data>/automations.json` and headless output is in `<data>/autoruns/` (see
+*Automations*).
 
 The sidebar's state is under `projects.ui.v1`: whether it shows, its width, the collapsed sections,
 the list shown (projects or Activity), the workspace options, the pinned and unread cards, whether
 Delete asks, when each fleet's coordinator was last focused (`fleet_seen`, for unread reports), and
-which projects' "PRs & issues" are expanded (`prs_open`).
+which projects' "PRs & issues" are expanded (`prs_open`). The Automations section's collapsed state is
+`collapsed.automations`.
 
 Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
 queue and helper, pane sessions and branches, the fleet scan, GitHub polling), `mailbox.py` (the socket helper), `window.luau`
@@ -361,7 +488,10 @@ flows), `pickers.luau` (search, options, settings, help, Orca shortcuts), `model
 ordering and persistence), `subagents.luau` (omp surface → subagents), `fleet.luau` (agent-fleet
 state → the fleet model, pure), `fleets.luau` (fleets in a window: states, clicks, unread, tab colors),
 `gh.luau` (GitHub remotes, gh JSON, CI rollup, branch → PR, the refresh clock; pure), `ghpoll.luau` (gh polling in
-the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, refresh, create),
+the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, refresh, create), `sched.luau`
+(schedules and their occurrences; pure), `automate.luau` (automation definitions, the scheduler tick, history; pure),
+`autohost.luau` (automations in the host half: the clock, runs, files), `autowin.luau` (automations in a window: the
+section, pane runs, actions),
 `sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
 and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
 
@@ -384,8 +514,8 @@ What Orca's sidebar does and this port can't, for lack of a Tern plugin API:
 - Tooltip styling and delay, a live minimum and maximum while dragging the divider, the sidebar's
   tint behind the title bar, toast buttons, selecting several cards, image project icons, colors
   other than Orca's eight presets.
-- Orca's nav rows (Tasks, Automations, Agent Dashboard, Orca Mobile), workspace board, hosts, issue
-  trackers other than GitHub's and setup scripts have no counterpart here.
+- Orca's nav rows (Tasks, Agent Dashboard, Orca Mobile; Automations is the section above), workspace board, hosts,
+  issue trackers other than GitHub's and setup scripts have no counterpart here.
 
 And the port's own:
 

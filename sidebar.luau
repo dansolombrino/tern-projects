@@ -125,6 +125,8 @@ export type Snapshot = {
 	waiting: number?,
 	-- Agent fleets (fleet.luau's model with each card's state), drawn above the projects.
 	fleets: { FleetSnap }?,
+	-- Automations (autowin.luau): drawn after the projects.
+	autos: AutoSnap?,
 }
 
 -- A fleet worker or coordinator card's state: working | waiting (its agent needs the user) | ask (it asked the
@@ -162,6 +164,40 @@ export type FleetSnap = {
 	legacy: boolean?,
 	coordinator: { pane: number?, title: string, state: string, session: string?, queued: number? },
 	groups: { FleetGroupSnap },
+}
+
+-- One automation: its schedule, next run, active run (queued, precheck, starting, running) and latest finished run.
+export type AutoRun = {
+	id: string,
+	n: number,
+	status: string,
+	trigger: string?,
+	scheduled_for: number?,
+	started: number?,
+	ended: number?,
+	count: number?,
+	summary: string?,
+	note: string?,
+	out: string?,
+	pane: number?,
+	mode: string?,
+}
+export type AutoRow = {
+	id: string,
+	name: string,
+	enabled: boolean,
+	label: string,
+	run_in: string,
+	next_at: number?,
+	active: AutoRun?,
+	last: AutoRun?,
+}
+export type AutoSnap = {
+	list: { AutoRow },
+	-- Problems in automations.json, one line each.
+	errors: { string },
+	open: boolean,
+	running: number,
 }
 
 local sidebar = {}
@@ -210,7 +246,14 @@ sidebar.ACT = {
 	gh_refresh = "gh_refresh",
 	-- value: project id: expand or collapse its "PRs & issues"
 	toggle_prs = "toggle_prs",
-	-- no value
+	-- value: automation id: run now, enable or pause, open its latest output, its runs
+	auto_run = "auto_run",
+	auto_toggle = "auto_toggle",
+	auto_open = "auto_open",
+	auto_runs = "auto_runs",
+	-- no value (this and every action below): a new automation, edit automations.json
+	auto_new = "auto_new",
+	auto_edit = "auto_edit",
 	collapse_all = "collapse_all",
 	add_project = "add_project",
 	search = "search",
@@ -1395,6 +1438,168 @@ local function fleet_section(snap: Snapshot, f: FleetSnap): any
 	}, children)
 end
 
+-- Automations ------------------------------------------------------------------
+
+-- A run status's label (automate.luau's statuses).
+local AUTO_LABEL: { [string]: string } = {
+	queued = "Queued",
+	precheck = "Precheck",
+	waiting_window = "Starting",
+	running = "Running",
+	done = "Done",
+	failed = "Failed",
+	timed_out = "Timed out",
+	canceled = "Canceled",
+	lost = "Lost",
+	skipped_missed = "Missed",
+	skipped_busy = "Skipped (busy)",
+	skipped_precheck = "Skipped (precheck)",
+}
+sidebar.AUTO_LABEL = AUTO_LABEL
+
+local AUTO_FINAL: { [string]: boolean } = {
+	done = true,
+	failed = true,
+	timed_out = true,
+	canceled = true,
+	lost = true,
+	skipped_missed = true,
+	skipped_busy = true,
+	skipped_precheck = true,
+}
+
+function sidebar.auto_active(status: string): boolean
+	return not AUTO_FINAL[status]
+end
+
+-- A run status → the row's dot.
+local function auto_glyph(status: string): string
+	if not AUTO_FINAL[status] then
+		return "working"
+	elseif status == "done" then
+		return "done"
+	elseif status == "failed" or status == "timed_out" or status == "lost" then
+		return "failed"
+	end
+	return "interrupted"
+end
+
+-- When the next run is: "in 4m", "14:30" (today), "Tue 09:00" (later).
+function sidebar.when(now: number, t: number): string
+	local d = t - now
+	if d < 60 then
+		return "in <1m"
+	elseif d < 3600 then
+		return string.format("in %dm", math.ceil(d / 60))
+	end
+	local today = os.date("%Y%m%d", now)
+	if os.date("%Y%m%d", t) == today then
+		return os.date("%H:%M", t) :: string
+	end
+	return os.date("%a %H:%M", t) :: string
+end
+
+local function auto_row(snap: Snapshot, a: AutoRow): any
+	local now = snap.now or os.time()
+	local r = a.active or a.last
+	local state = if not a.enabled and a.active == nil then "inactive" elseif r then auto_glyph(r.status) else "idle"
+	local plan = if a.enabled
+		then (if a.next_at then "next " .. sidebar.when(now, a.next_at :: number) else "scheduling")
+		else "paused"
+	local lead: string
+	local tip = { a.name, a.label .. " · " .. plan .. " · " .. (if a.run_in == "pane" then "in a pane" else "headless") }
+	if a.active then
+		local act_run = a.active :: AutoRun
+		lead = (AUTO_LABEL[act_run.status] or act_run.status) .. (if act_run.note then " · " .. act_run.note else "")
+	elseif a.last then
+		local l = a.last :: AutoRun
+		lead = (AUTO_LABEL[l.status] or l.status) .. (if l.count and l.count > 1 then string.format(" ×%d", l.count) else "") .. (if l.summary then ": " .. (first_line(l.summary) or "") else "")
+	else
+		lead = "No runs yet"
+	end
+	table.insert(tip, lead)
+	if r and r.summary and r.summary ~= "" then
+		table.insert(tip, r.summary :: string)
+	end
+	table.insert(tip, "Click for its runs; right-click for more")
+	local ago = if r then sidebar.ago(now, r.ended or r.started or r.scheduled_for) else nil
+	local menu: { any } = {
+		{ id = act("auto_run", a.id), label = "Run now", icon = "rocket" },
+		{ id = act("auto_toggle", a.id), label = if a.enabled then "Pause" else "Enable", icon = "settings" },
+		{ id = act("auto_open", a.id), label = "Open latest output", icon = "doc" },
+		{ id = act("auto_runs", a.id), label = "Runs…", icon = "list" },
+		{ id = act("auto_edit"), label = "Edit automations.json", icon = "doc" },
+	}
+	local acts: { any } = {
+		el("button", { key = "run", class = "op-ib op-sm op-txt", title = "Run now", actions = { click = act("auto_run", a.id) } }, {
+			span("op-txt-g", "▶", "g"),
+		}),
+		el("button", { key = "tog", class = "op-ib op-sm op-txt", title = if a.enabled then "Pause" else "Enable", actions = { click = act("auto_toggle", a.id) } }, {
+			span("op-txt-g", if a.enabled then "⏸" else "⏵", "g"),
+		}),
+	}
+	if r and (r.out or r.pane) then
+		table.insert(acts, el("button", { key = "open", class = "op-ib op-sm op-txt", title = "Open latest output", actions = { click = act("auto_open", a.id) } }, {
+			span("op-txt-g", "↗", "g"),
+		}))
+	end
+	local last_kids: { any } = { glyph(state, "sm"), span("op-auto-l", lead, "l") }
+	if ago then
+		table.insert(last_kids, span("op-time", ago, "time"))
+	end
+	return el("div", {
+		key = key_of("a_", a.id),
+		class = "op-auto" .. (if a.enabled then "" else " op-off") .. (if a.active then " op-run" else ""),
+		title = table.concat(tip, "\n"),
+		actions = { click = act("auto_runs", a.id), menu = menu },
+	}, {
+		el("div", { key = "top", class = "op-auto-top" }, {
+			span("op-auto-n", a.name, "n"),
+			span("op-auto-s", plan .. " · " .. a.label, "s"),
+			el("div", { key = "acts", class = "op-auto-acts" }, acts),
+		}),
+		el("div", { key = "last", class = "op-auto-last" }, last_kids),
+	})
+end
+
+-- The Automations section: header (counts, edit file, new), problems in the file, one row per automation.
+local function autos_section(snap: Snapshot, s: AutoSnap): any
+	local head_node = header(el("span", { key = "icon", class = "op-gicon op-c-fg" }, { icon_node("clock") }), "Automations", {
+		toggle = act("toggle_group", "automations"),
+		chevron = true,
+		more = act("auto_edit"),
+		more_title = "Edit automations.json",
+		new = act("auto_new"),
+		new_title = "New automation",
+	})
+	local n = #s.list
+	if n > 0 then
+		table.insert(head_node.c, 3, span("op-fsum", if s.running > 0 then string.format("%d · %d running", n, s.running) else tostring(n), "sum"))
+	end
+	local children: { any } = { head_node }
+	if s.open then
+		for i, e in s.errors do
+			if i > 3 then
+				break
+			end
+			children[#children + 1] = el("div", { key = string.format("err%d", i), class = "op-auto-err", title = e }, {
+				span("op-auto-l", e, "t"),
+			})
+		end
+		for _, a in s.list do
+			if nodes_left > 40 then
+				children[#children + 1] = auto_row(snap, a)
+			end
+		end
+		if n == 0 and #s.errors == 0 then
+			children[#children + 1] = el("div", { key = "none", class = "op-ghrow op-ghnone", actions = { click = act("auto_new") } }, {
+				span("op-ghrow-t", "No automations: + adds one", "t"),
+			})
+		end
+	end
+	return el("div", { key = "autos", class = "op-group op-autos" .. (if s.open then "" else " collapsed") }, children)
+end
+
 local function fleets(snap: Snapshot, list: { any })
 	for _, f in snap.fleets or {} do
 		list[#list + 1] = fleet_section(snap, f)
@@ -1678,6 +1883,9 @@ function sidebar.build(snap: Snapshot): { view: any, dock: any }
 					span("op-empty-bt", "Add project", "t"),
 				}),
 			})
+		end
+		if snap.autos ~= nil then
+			list[#list + 1] = autos_section(snap, snap.autos :: AutoSnap)
 		end
 	end
 	local view = el("div", { key = sidebar.ROOT_KEY, class = sidebar.ROOT_CLASS }, {

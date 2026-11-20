@@ -178,6 +178,8 @@ local function on_line(line: string)
 	else
 		pass_soon()
 	end
+	-- Automations: a new model, pane runs to start or to check (autowin.luau).
+	S.auto_wake()
 end
 
 start_watch = function()
@@ -235,4 +237,7 @@ return function(ctx: core.Ctx)
 	S.mail_enqueue = enqueue
 	S.mail_state = on_state
 	S.mail_start = start_watch
+	S.mail_leader = function(): boolean
+		return leader
+	end
 end

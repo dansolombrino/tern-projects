@@ -298,6 +298,13 @@ local function read_status()
 			S.dirty = true
 		end)
 	end
+	-- And the automations model (autowin.luau), when the host wrote a new one.
+	if doc.auto_sig ~= nil and doc.auto_sig ~= S.auto_sig and S.load_autos then
+		S.auto_sig = doc.auto_sig
+		tern.timer(0, function(_cx)
+			S.load_autos()
+		end)
+	end
 end
 
 -- The scan's first half, one native call: every agent block (`cx.agents:list()`), and whether any shown field of
