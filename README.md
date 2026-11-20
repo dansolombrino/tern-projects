@@ -343,6 +343,19 @@ Tern pauses every timer of a plugin for 5 s (doubling up to 5 min) when one wind
 50 ms of Lua or 500 ms with native calls (`tern: timer exceeded 50 ms` in `~/Library/Logs/Tern/tern.log`).
 The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` here):
 
+- The window entry's load is a hook too (500 ms of wall time, `require`'s compile included). Compiling every
+  module in the load took 57-62 ms in a freshly started window with four cores busy, but 240-310 ms in a window
+  that had been running for 40 minutes with many plugin reloads (Tern 0.9.29) and 350-470 ms there under load,
+  sometimes over 500 (`plugin window entry failed to load … load exceeded 500 ms`, the whole window half gone
+  for the run). So the load requires only `base.luau` and `budget.luau` and registers commands, hooks and the
+  status segment (1-2 ms fresh, 2-14 ms in
+  the slow window under load); every other module compiles in a timer callback of its own (`STAGES` in
+  window.luau, dependencies first so each compiles one file; the largest, sidebar.luau, 10 ms fresh and 35-125 ms
+  in the slow window), then one callback runs the installers, one `init`, and one the hooks that arrived before
+  `init` (queued, in order; until then the status segment is the plain sidebar toggle). All the stages' timers
+  start at load, so they run within a turn or two (`init` about 75 ms after the load fresh, 0.4-0.7 s in the
+  slow window); a stage is logged as slow past 250 ms. `python3 tests/test_window_load.py` checks the load
+  compiles nothing else and each stage one module.
 - Work runs in labelled timer callbacks; event, click and command hooks only queue it. Each callback
   does one heavy thing: the sidebar's placement check, the agent scan (`cx.agents:list()`), one surface
   or transcript read, one draw, one mailbox delivery. A callback over 25 ms is logged with its label;
@@ -479,7 +492,8 @@ which projects' "PRs & issues" are expanded (`prs_open`). The Automations sectio
 
 Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
 queue and helper, pane sessions and branches, the fleet scan, GitHub polling), `mailbox.py` (the socket helper), `window.luau`
-(commands, events, chrome and wiring), `core.luau` (the shared state, the agent scan, lookups),
+(commands, hooks, chrome and staged loading), `base.luau` (the constants the load needs), `events.luau` (what the
+hooks, clicks and status segment do, and `init`), `core.luau` (the shared state, the agent scan, lookups),
 `budget.luau` (labelled, timed callbacks), `identity.luau` (records ↔ panes), `mailq.luau` (the
 mailbox queue), `mail.luau` (mailbox delivery and report-back in a window), `placement.luau` (the
 sidebar's docking, width and refresh), `snapshot.luau` (what the sidebar draws), `agents.luau`
@@ -493,7 +507,8 @@ the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, ref
 `autohost.luau` (automations in the host half: the clock, runs, files), `autowin.luau` (automations in a window: the
 section, pane runs, actions),
 `sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
-and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`).
+and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`;
+`python3 tests/test_window_load.py`).
 
 `window.luau` stays small on purpose: Luau allows 200 locals in a file's top level, which one file
 holding everything exceeded (`luau-compile -O0 --binary <file>` checks a file loads).

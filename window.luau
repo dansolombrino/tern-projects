@@ -9,9 +9,10 @@
 -- model.luau holds the data, subagents.luau and sidebar.luau the pure surface reading and drawing.
 --
 -- Loading is staged (README, Budget): Tern counts `require`'s compile toward the load's 500 ms of wall time, and
--- compiling every module took 240-310 ms on an idle machine and 350-470 ms (sometimes over 500) under load. So the
--- load requires only base.luau and budget.luau and registers the hooks (2-6 ms); the modules compile one per timer
--- callback (`STAGES`), and a hook arriving before `init` is queued and runs, in order, right after it.
+-- compiling every module there took 57-62 ms in a fresh window but 240-470 ms (sometimes over 500) in one that had
+-- run a while. So the load requires only base.luau and budget.luau and registers the hooks (1-14 ms); the modules
+-- compile one per timer callback (`STAGES`), and a hook arriving before `init` is queued and runs, in order, right
+-- after it.
 
 local base = require("./base")
 local budget = require("./budget")
@@ -235,7 +236,7 @@ end)
 -- Staged loading --------------------------------------------------------------------------
 
 -- One module compiled per timer callback, dependencies first, so each `require` compiles one file (a module
--- already loaded is cached). The largest take 35-125 ms of wall time (sidebar, snapshot, agents), against 500.
+-- already loaded is cached). The largest, sidebar.luau, takes 10-125 ms of wall time, against 500.
 local STAGES: { { label: string, run: (cx: WindowCx) -> () } } = {
 	{ label = "load model", run = function() require("./model") end },
 	{ label = "load identity", run = function() require("./identity") end },
