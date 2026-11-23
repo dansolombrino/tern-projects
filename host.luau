@@ -433,7 +433,10 @@ end)()
 local function all_projects(): { bridge.SyncProject }
 	local locals: { bridge.SyncProject } = {}
 	for _, p in model.load().projects do
-		table.insert(locals, { id = p.id, name = p.name, root = p.root })
+		-- A project on another Tern host is that host's half's to read (through its bridge's `sync`).
+		if p.host == nil then
+			table.insert(locals, { id = p.id, name = p.name, root = p.root })
+		end
 	end
 	return bridge.union_projects(locals, synced)
 end
@@ -451,8 +454,14 @@ local function write_status()
 		end
 	end
 	local state = model.load()
+	local remote_ids: { [string]: boolean } = {}
+	for _, p in state.projects do
+		if p.host ~= nil then
+			remote_ids[p.id] = true
+		end
+	end
 	for _, m in state.agents do
-		if m.worktree then
+		if m.worktree and not remote_ids[m.project] then
 			cwds[m.worktree :: string] = true
 		end
 	end

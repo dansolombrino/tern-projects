@@ -158,7 +158,8 @@ function M.merge(status: any, wpane: (number) -> number?, sessions: { [number]: 
 	end
 	if type(status.repos) == "table" then
 		for cwd, r in status.repos do
-			if type(cwd) == "string" and repos[cwd] == nil then
+			-- A local entry with no head is a failed read of a folder this machine doesn't have: the remote one wins.
+			if type(cwd) == "string" and (repos[cwd] == nil or (repos[cwd].head == nil and type(r) == "table" and r.head ~= nil)) then
 				repos[cwd] = r
 			end
 		end
