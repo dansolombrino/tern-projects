@@ -11,6 +11,9 @@
 -- - GitHub (ghpoll.luau): the PRs and issues of every project's repository and the PR of every branch a card shows,
 --   read with `gh` on a rate-limited clock and written to `<data>/gh.json`.
 -- - Automations (autohost.luau): the scheduler of Orca-style automations, its headless runs and history.
+-- - The bridge block (`projects.bridge`, bridge.luau): how a window on another machine reaches this half. Its view
+--   carries this host's status, fleets, GitHub data, automations, queued mail and request replies; its events are
+--   requests (spool reports, git, folder reads, the window's projects on this host).
 
 local mailq = require("./mailq")
 local model = require("./model")
@@ -18,6 +21,7 @@ local identity = require("./identity")
 local fleet = require("./fleet")
 local ghpoll = require("./ghpoll")
 local autohost = require("./autohost")
+local bridge = require("./bridge")
 
 local DATA = tern.plugin.data
 local SPOOL = DATA .. "/spool"
@@ -26,9 +30,12 @@ local FLEET = DATA .. "/fleet.json"
 -- The agent-fleet state root (fleet.luau), fixed for the daemon's environment.
 local FLEET_ROOT = fleet.state_root(tern.getenv)
 local HELPER = tern.plugin.dir .. "/mailbox.py"
--- The CLI for `tern inspect`: the daemon's own executable when it says, else the app's, else PATH's.
-local TERN_CLI = tern.getenv("TERN_EXE")
-	or (if tern.fs.exists("/Applications/Tern.app/Contents/MacOS/tern") then "/Applications/Tern.app/Contents/MacOS/tern" else "tern")
+local HOME = tern.getenv("HOME")
+-- The CLI for `tern inspect` (bridge.tern_cli: the daemon's own executable, the app's, the Linux install's, PATH's).
+local TERN_CLI = bridge.tern_cli(tern.getenv, tern.fs.exists)
+-- Where agent-fleet scripts look for mailbox.json when that is not `<data>/mailbox.json` (Linux: the daemon's data
+-- dir is under ~/.local/state, the scripts look under the config dir); the helper publishes it there too.
+local DISCOVERY = bridge.discovery_path(tern.getenv, tern.runtime.os, tern.plugin.id, DATA)
 
 -- How often the spool is applied and pane sessions are polled, and how long a branch read stays fresh.
 local SPOOL_MS = 400
@@ -50,8 +57,12 @@ local box: mailq.Box = (function()
 	return mailq.normalize(if ok then raw else nil)
 end)()
 
+-- The bridge's mail node is rebuilt only after the queue changed.
+local mail_dirty = true
+
 local function save_box()
 	tern.kv.set(mailq.KEY, mailq.encode(box, tern.json.array))
+	mail_dirty = true
 end
 
 -- Live panes: id → cwd and omp session file (when it runs omp), from the last poll.
@@ -147,7 +158,12 @@ start_helper = function()
 	if unloading or helper then
 		return
 	end
-	local ok, child = pcall(tern.process.spawn, { "/usr/bin/env", "python3", HELPER, "serve", "--data", DATA }, {
+	local argv = { "/usr/bin/env", "python3", HELPER, "serve", "--data", DATA }
+	if DISCOVERY then
+		table.insert(argv, "--discovery")
+		table.insert(argv, DISCOVERY :: string)
+	end
+	local ok, child = pcall(tern.process.spawn, argv, {
 		stdout = function(line: string)
 			on_line(line)
 		end,
@@ -188,6 +204,25 @@ end)
 
 local tries: { [string]: number } = {}
 
+-- Applies one spool object (a spool file's, or a remote window's through the bridge); true when the mailbox changed
+-- (the caller saves it).
+local function apply_one(obj: { [string]: any }, now: number): boolean
+	if obj.op == "deliver" then
+		-- A report-back from a window: stored whatever the target's state (its parent was alive).
+		local _, c = mailq.submit(box, obj, now, function()
+			return true
+		end)
+		return c
+	elseif obj.op == "ack" then
+		return mailq.apply(box, obj, now)
+	elseif type(obj.op) == "string" and string.sub(obj.op, 1, 5) == "auto_" then
+		autohost.spool(obj)
+	else
+		ghpoll.spool(obj)
+	end
+	return false
+end
+
 local function apply_spool()
 	local ok, names = pcall(tern.fs.list, SPOOL)
 	if not ok then
@@ -205,19 +240,7 @@ local function apply_spool()
 				dok, obj = pcall(tern.json.decode, text)
 			end
 			if dok and type(obj) == "table" then
-				if obj.op == "deliver" then
-					-- A report-back from a window: stored whatever the target's state (its parent was alive).
-					local _, c = mailq.submit(box, obj, now, function()
-						return true
-					end)
-					changed = changed or c
-				elseif obj.op == "ack" then
-					changed = mailq.apply(box, obj, now) or changed
-				elseif type(obj.op) == "string" and string.sub(obj.op, 1, 5) == "auto_" then
-					autohost.spool(obj)
-				else
-					ghpoll.spool(obj)
-				end
+				changed = apply_one(obj, now) or changed
 				pcall(tern.fs.remove, path)
 				tries[name] = nil
 			else
@@ -400,6 +423,24 @@ local function scan_fleets()
 	end
 end
 
+-- Projects the windows of another machine keep on this host (the bridge's `sync`), kept across restarts: GitHub
+-- wants, branch reads and automations' `project` see them beside this machine's own model.
+local synced: bridge.Sync? = (function(): bridge.Sync?
+	local ok, raw = pcall(tern.kv.get, bridge.SYNC_KEY)
+	return if ok and type(raw) == "table" then bridge.sync_of(raw, HOME, os.time()) else nil
+end)()
+
+local function all_projects(): { bridge.SyncProject }
+	local locals: { bridge.SyncProject } = {}
+	for _, p in model.load().projects do
+		table.insert(locals, { id = p.id, name = p.name, root = p.root })
+	end
+	return bridge.union_projects(locals, synced)
+end
+
+-- status.json's text, for the bridge's status node.
+local status_text = "{}"
+
 local function write_status()
 	local out_panes: { [string]: any } = {}
 	local cwds: { [string]: boolean } = {}
@@ -413,6 +454,11 @@ local function write_status()
 	for _, m in state.agents do
 		if m.worktree then
 			cwds[m.worktree :: string] = true
+		end
+	end
+	if synced then
+		for _, w in (synced :: bridge.Sync).worktrees do
+			cwds[w] = true
 		end
 	end
 	local out_repos: { [string]: any } = {}
@@ -449,7 +495,294 @@ local function write_status()
 	for k, v in autohost.stats() do
 		doc[k] = v
 	end
-	pcall(tern.fs.write, STATUS, tern.json.encode(doc))
+	status_text = tern.json.encode(doc)
+	pcall(tern.fs.write, STATUS, status_text)
+end
+
+-- The bridge block ------------------------------------------------------------------------
+
+-- Every live bridge block (one per window that opened one), by its pane id here.
+local blocks: { [number]: BlockCx } = {}
+local sigs = bridge.sigs(string.format("%d-%d", os.time(), math.random(1, 1000000)))
+local wins: bridge.Wins = {}
+local win_seq = 0
+local leader: string? = nil
+local replies: bridge.Replies = {}
+local replies_dirty = true
+local seen: bridge.Seen = {}
+local gh_seen: string? = nil
+local autos_seen: string? = nil
+-- A node changed since the blocks last rendered.
+local render_pending = false
+local refresh_queued = false
+local hostname = tern.getenv("HOSTNAME") or ""
+
+local function read_text(path: string): string
+	local ok, text = pcall(tern.fs.read, path, 4194304)
+	return if ok and type(text) == "string" and text ~= "" then text else "{}"
+end
+
+-- Rebuilds the node texts that may have changed; marks a render when one did.
+local function update_nodes()
+	local now = os.time()
+	local changed = bridge.track(sigs, "status", status_text)
+	changed = bridge.track(sigs, "fleet", fleet_json or "{}") or changed
+	-- gh.json and autos.json are re-read only when their writer's sig moved.
+	local gs = ghpoll.stats().gh_sig
+	if gs ~= gh_seen then
+		gh_seen = gs
+		changed = bridge.track(sigs, "gh", read_text(DATA .. "/gh.json")) or changed
+	end
+	local as = autohost.stats().auto_sig
+	if as ~= autos_seen then
+		autos_seen = as
+		changed = bridge.track(sigs, "autos", read_text(DATA .. "/autos.json")) or changed
+	end
+	if mail_dirty then
+		mail_dirty = false
+		local doc = bridge.mail_doc(box)
+		changed = bridge.track(sigs, "mail", tern.json.encode({ seq = doc.seq, msgs = tern.json.array(doc.msgs) })) or changed
+	end
+	if bridge.prune_replies(replies, now) or replies_dirty then
+		replies_dirty = false
+		changed = bridge.track(sigs, "replies", tern.json.encode(bridge.replies_doc(replies))) or changed
+	end
+	bridge.prune_wins(wins, now)
+	bridge.prune_seen(seen, now)
+	leader = bridge.leader(wins, now)
+	-- The header's `at` and `pane` are filled at view time; what else it says changes rarely.
+	changed = bridge.track(sigs, "header", hostname .. "\n" .. (HOME or "") .. "\n" .. (leader or "")) or changed
+	if changed then
+		render_pending = true
+	end
+end
+
+local function bridge_refresh()
+	refresh_queued = false
+	if next(blocks) == nil then
+		return
+	end
+	update_nodes()
+	if not render_pending then
+		return
+	end
+	render_pending = false
+	for pane, cx in blocks do
+		-- A block whose pane closed raises: forget it.
+		if not pcall(cx.render, cx) then
+			blocks[pane] = nil
+		end
+	end
+end
+
+-- Refreshes in a callback of its own, once however many changes asked for it.
+local function bridge_soon()
+	if refresh_queued or unloading then
+		return
+	end
+	refresh_queued = true
+	tern.timer(0, bridge_refresh)
+end
+
+local function reply(id: string, r: { [string]: any })
+	bridge.put_reply(replies, id, r, os.time())
+	replies_dirty = true
+	bridge_soon()
+end
+
+local function fail(id: string, err: any)
+	reply(id, { ok = false, error = tostring(err) })
+end
+
+local function op_spool(req: bridge.Request)
+	local id = req.id :: string
+	local now = os.time()
+	-- A resend (the window timed out waiting) is answered without applying it again.
+	if bridge.seen(seen, id, now) then
+		reply(id, { ok = true })
+		return
+	end
+	local ok, changed = pcall(apply_one, req.obj, now)
+	if not ok then
+		fail(id, changed)
+		return
+	end
+	if changed then
+		save_box()
+		notify()
+	end
+	reply(id, { ok = true })
+end
+
+local function op_git(req: bridge.Request)
+	local id = req.id :: string
+	local argv = { "git" }
+	for _, a in req.args do
+		table.insert(argv, a)
+	end
+	local opts: ProcessOptions = { timeout_ms = bridge.git_timeout(req.timeout_ms) }
+	if req.cwd then
+		opts.cwd = bridge.expand(req.cwd, HOME)
+	end
+	local ok, err = pcall(tern.process.run, argv, opts, function(res: ProcessResult)
+		reply(id, bridge.git_reply(res))
+	end)
+	if not ok then
+		fail(id, err)
+	end
+end
+
+-- `dirs`: the subfolders (find) and whether the folder is in a git work tree (git), two processes, one reply.
+local function op_dirs(id: string, path: string)
+	if not tern.fs.exists(path) then
+		fail(id, "no such folder: " .. path)
+		return
+	end
+	local names: { string }? = nil
+	local find_err: string? = nil
+	local in_git: boolean? = nil
+	local function done()
+		if names == nil and find_err == nil or in_git == nil then
+			return
+		end
+		if find_err then
+			fail(id, find_err)
+		else
+			reply(id, { ok = true, value = tern.json.array(names :: { string }), git = in_git })
+		end
+	end
+	local fok, ferr = pcall(tern.process.run, { "find", "-L", path, "-mindepth", "1", "-maxdepth", "1", "-type", "d" }, { timeout_ms = 10000 }, function(res: ProcessResult)
+		-- find says 1 when some entry was unreadable; what it listed still counts.
+		if res.status ~= 0 and res.stdout == "" then
+			find_err = if res.stderr ~= "" then bridge.cap(res.stderr, 2000) else "find failed"
+		else
+			names = bridge.dir_names(res.stdout)
+		end
+		done()
+	end)
+	if not fok then
+		fail(id, ferr)
+		return
+	end
+	local gok = pcall(tern.process.run, { "git", "-C", path, "rev-parse", "--is-inside-work-tree" }, { timeout_ms = 10000 }, function(res: ProcessResult)
+		in_git = res.status == 0 and string.match(res.stdout, "^true") ~= nil
+		done()
+	end)
+	if not gok then
+		in_git = false
+		done()
+	end
+end
+
+local function op_fs(req: bridge.Request)
+	local id = req.id :: string
+	if req.fn == "home" then
+		reply(id, { ok = true, value = HOME or tern.json.null })
+		return
+	end
+	local path = bridge.expand(req.path, HOME)
+	if req.fn == "exists" then
+		reply(id, { ok = true, value = tern.fs.exists(path) })
+	elseif req.fn == "mkdir" then
+		local ok, err = pcall(tern.fs.mkdir, path)
+		reply(id, if ok then { ok = true } else { ok = false, error = tostring(err) })
+	else
+		op_dirs(id, path)
+	end
+end
+
+local function op_sync(req: bridge.Request)
+	local s = bridge.sync_of(req, HOME, os.time())
+	synced = s
+	local ok, err = pcall(tern.kv.set, bridge.SYNC_KEY, {
+		projects = tern.json.array(s.projects),
+		worktrees = tern.json.array(s.worktrees),
+		visible = s.visible,
+		at = s.at,
+	})
+	if not ok then
+		tern.log.warn("projects: synced projects not saved", err)
+	end
+	reply(req.id :: string, { ok = true })
+end
+
+local function on_request(text: string)
+	local dok, req = pcall(tern.json.decode, text)
+	local code, message, id = bridge.validate(if dok then req else nil)
+	if code then
+		if id then
+			reply(id :: string, { ok = false, error = code, message = message })
+		end
+		return
+	end
+	if req.op == "hello" then
+		win_seq = bridge.hello(wins, req.win, os.time(), win_seq)
+		bridge_soon()
+	elseif req.op == "spool" then
+		op_spool(req)
+	elseif req.op == "git" then
+		op_git(req)
+	elseif req.op == "fs" then
+		op_fs(req)
+	else
+		op_sync(req)
+	end
+end
+
+type BridgeState = {}
+
+tern.block.define("bridge", {
+	init = function(cx: BlockCx, _args: { string }, _saved: any): BridgeState
+		blocks[cx.pane] = cx
+		update_nodes()
+		bridge_soon()
+		return {}
+	end,
+	title = function(_state: BridgeState): string?
+		return "Projects bridge"
+	end,
+	view = function(_state: BridgeState, cx: BlockCx): BlockView
+		local header = bridge.header(sigs, {
+			host = hostname,
+			home = HOME,
+			os = tern.runtime.os,
+			pane = cx.pane,
+			at = os.time(),
+			leader = leader,
+			null = tern.json.null,
+		})
+		local nodes = { tern.ui.text(tern.json.encode(header)) }
+		-- main.1 .. main.6: a col each, of text children of at most bridge.CHUNK bytes (main.K.I).
+		for i = 2, #bridge.NODES do
+			local parts: { Node } = {}
+			for _, piece in sigs.chunks[bridge.NODES[i]] or { "{}" } do
+				table.insert(parts, tern.ui.text(piece))
+			end
+			table.insert(nodes, tern.ui.col(parts))
+		end
+		return { main = tern.ui.col(nodes) }
+	end,
+	event = function(_state: BridgeState, ev: UiEvent, cx: BlockCx)
+		blocks[cx.pane] = cx
+		local text = bridge.request_text(ev)
+		if text then
+			local ok, err = pcall(on_request, text)
+			if not ok then
+				tern.log.warn("projects: bridge request failed", err)
+			end
+		end
+	end,
+} :: BlockDef<BridgeState>)
+
+-- The header names the host; the daemon's environment rarely has HOSTNAME.
+if hostname == "" then
+	pcall(tern.process.run, { "hostname" }, { timeout_ms = 5000 }, function(res: ProcessResult)
+		local name = string.match(res.stdout, "^%s*(.-)%s*$")
+		if res.status == 0 and name and name ~= "" then
+			hostname = name
+			bridge_soon()
+		end
+	end)
 end
 
 -- Clocks -------------------------------------------------------------------------------
@@ -468,7 +801,12 @@ local function every(ms: number, label: string, fn: () -> ())
 	tern.timer(ms, tick)
 end
 
-every(SPOOL_MS, "spool", apply_spool)
+every(SPOOL_MS, "spool", function()
+	apply_spool()
+	if mail_dirty then
+		bridge_soon()
+	end
+end)
 every(PANES_MS, "status", function()
 	poll_panes()
 	local ok, err = pcall(scan_fleets)
@@ -476,13 +814,14 @@ every(PANES_MS, "status", function()
 		tern.log.warn("projects: host fleet scan failed", err)
 	end
 	write_status()
+	bridge_soon()
 end)
 
 -- GitHub: what the sidebar shows, as folders with the branch each card shows.
 ghpoll.start({
 	wants = function(): { ghpoll.Want }
 		local out: { ghpoll.Want } = {}
-		for _, p in model.load().projects do
+		for _, p in all_projects() do
 			table.insert(out, { dir = p.root })
 		end
 		for cwd, r in repos do
@@ -506,14 +845,19 @@ ghpoll.start({
 		return out
 	end,
 	shown = function(): boolean
-		return model.load_ui().visible
+		-- A remote window's sidebar counts while that window is live.
+		local remote = synced ~= nil and (synced :: bridge.Sync).visible and bridge.leader(wins, os.time()) ~= nil
+		return remote or model.load_ui().visible
 	end,
 	branch_of = function(cwd: string): string?
 		local r = repos[cwd]
 		return if r then r.branch else nil
 	end,
 })
-every(GH_MS, "github", ghpoll.tick)
+every(GH_MS, "github", function()
+	ghpoll.tick()
+	bridge_soon()
+end)
 
 autohost.start({
 	notify = notify,
@@ -528,14 +872,13 @@ autohost.start({
 		return out
 	end,
 	projects = function(): { any }
-		local out = {}
-		for _, p in model.load().projects do
-			table.insert(out, { id = p.id, name = p.name, root = p.root })
-		end
-		return out
+		return all_projects()
 	end,
 })
-every(AUTO_MS, "automations", autohost.tick)
+every(AUTO_MS, "automations", function()
+	autohost.tick()
+	bridge_soon()
+end)
 
 poll_panes()
 start_helper()

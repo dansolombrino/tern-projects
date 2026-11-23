@@ -26,6 +26,8 @@ export type Project = {
 	icon: { kind: "icon" | "emoji", name: string?, emoji: string? }?,
 	worktrees: boolean?,
 	created: number?,
+	-- The remote Tern host it lives on (`ManagedHost.name`); nil for this machine.
+	host: string?,
 }
 
 export type AgentRow = {
@@ -73,6 +75,8 @@ export type ProjectSnap = {
 	current: boolean,
 	agents: { AgentRow },
 	group: Group?,
+	-- Its remote host's short name (`rig-4090`), shown as a muted tag on its header; nil for this machine.
+	host: string?,
 	-- Its GitHub repository's PRs and issues; nil outside GitHub.
 	gh: GhSnap?,
 }
@@ -734,9 +738,12 @@ local function card_menu(ctx: Ctx, row: AgentRow): { any }
 	end
 	-- Matches the card's own unread look (and toggle_unread, which clears the spawned descendants too).
 	local unread = any_unread(ctx.snap, row)
+	-- A remote project's folder can't be shown here: its item opens a shell on that host instead.
+	local host = if ctx.project then ctx.project.host else nil
+	local open = if host then "Open terminal on " .. (string.match(host, "@([^@]+)$") or host) else "Open in Finder"
 	local menu: { any } = {
 		{ id = act("rename", pane), label = "Rename", icon = "doc" },
-		{ id = act("open_finder", pane), label = "Open in Finder", icon = "folder-open" },
+		{ id = act("open_finder", pane), label = open, icon = if host then "terminal" else "folder-open" },
 		{ id = act("copy_path", pane), label = "Copy Path", icon = "copy" },
 		{ id = act("copy_name", pane), label = "Copy Worktree Name", icon = "copy" },
 		"-",
@@ -1155,6 +1162,10 @@ local function project_section(snap: Snapshot, ps: ProjectSnap): any
 	if counts ~= nil then
 		-- After the name, before the hover actions.
 		table.insert(head.c, 3, span("op-ghc" .. (if (ps.gh :: GhSnap).stale then " op-stale" else ""), counts, "ghc"))
+	end
+	if ps.host ~= nil then
+		-- Right after the name: which machine the project's folder and agents are on.
+		table.insert(head.c, 3, span("op-fb op-host", ps.host :: string, "host"))
 	end
 	local children: { any } = { head }
 	if not shut then

@@ -267,6 +267,17 @@ test("project groups and headers", function()
 	eq(node(view, GAMMA .. ".head.acts.chev"), nil, "empty project: no chevron")
 	eq(click(view, GAMMA .. ".head.acts.new"), "new_agent=gamma.x/y", "id kept")
 	eq(click(view, LIST .. ".unassigned.c_14"), "focus=14", "unassigned card focuses")
+
+	eq(node(view, ALPHA .. ".head.host"), nil, "local project: no host tag")
+	eq(node(view, CARD).p.actions.menu[2].label, "Open in Finder", "local card opens in Finder")
+	snap = snapshot()
+	snap.projects[1].host = "rig-4090"
+	snap.projects[1].project.host = "me@rig-4090"
+	view = sidebar.build(snap).view
+	local tag = node(view, ALPHA .. ".head.host")
+	eq(tag and tag.p.text, "rig-4090", "remote project: host tag")
+	check(has_class(tag, "op-fb"), "host tag is a muted badge")
+	eq(node(view, CARD).p.actions.menu[2].label, "Open terminal on rig-4090", "remote card opens a shell on its host")
 end)
 
 test("pinned and group by none", function()

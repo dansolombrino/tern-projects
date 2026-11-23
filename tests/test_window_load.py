@@ -18,7 +18,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 # The host half's modules: a window never loads them.
-HOST_ONLY = {"host", "autohost", "automate", "ghpoll"}
+HOST_ONLY = {"host", "autohost", "automate", "ghpoll", "bridge"}
 
 HARNESS = r"""
 local SOURCES = SOURCES_TABLE

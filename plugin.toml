@@ -7,3 +7,8 @@ icon = "folder"
 host = "host.luau"
 window = "window.luau"
 styles = ["sidebar.css", "chrome.css"]
+
+[[blocks]]
+id = "bridge"
+title = "Projects bridge"
+palette = false

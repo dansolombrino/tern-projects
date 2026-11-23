@@ -2,7 +2,9 @@
 -- projects, pull requests and issues in a window: reads the GitHub model the host half writes (`<data>/gh.json`,
 -- ghpoll.luau) when `gh_sig` in status.json changed, gives the sidebar each card's PR badge and each project's "PRs &
 -- issues", opens PRs and issues in the system browser, asks the host for a refresh, and creates a PR for the focused
--- worktree's branch (the host runs `git push` and `gh pr create --fill`; gh runs only in the host half).
+-- worktree's branch (the host runs `git push` and `gh pr create --fill`; gh runs only in the host half). Remote
+-- hosts' models (their bridge's gh node, remote.luau) are looked up after this machine's; requests about a remote
+-- folder go to its host.
 
 local gh = require("./gh")
 local model = require("./model")
@@ -13,21 +15,41 @@ local S: core.Ctx = nil :: any
 
 local DATA = tern.plugin.data
 local FILE = DATA .. "/gh.json"
-local SPOOL = DATA .. "/spool"
 local BYTES = 4194304
 
 type Model = { me: string?, repos: { [string]: gh.Repo & { busy: boolean? } }, dirs: { [string]: string }, created: { [string]: any } }
 
-local spool_seq = 0
-local function spool_write(obj: { [string]: any })
-	spool_seq += 1
-	local name = string.format("%012d-%06d-%04x.json", os.time(), spool_seq, math.random(0, 0xffff))
-	pcall(tern.fs.mkdir, SPOOL)
-	tern.fs.write(SPOOL .. "/" .. name, tern.json.encode(obj))
+-- Create requests this window sent, by id, until the host answers (`host`: the remote host asked, nil here).
+local asked: { [string]: { branch: string, slug: string, host: string? } } = {}
+-- Remote hosts' models, by host.
+local remote_models: { [string]: Model } = {}
+
+local function model_of(doc: any): Model?
+	if type(doc) ~= "table" or doc.version ~= gh.VERSION then
+		return nil
+	end
+	return {
+		me = if type(doc.me) == "string" then doc.me else nil,
+		repos = if type(doc.repos) == "table" then doc.repos else {},
+		dirs = if type(doc.dirs) == "table" then doc.dirs else {},
+		created = if type(doc.created) == "table" then doc.created else {},
+	}
 end
 
--- Create requests this window sent, by id, until the host answers.
-local asked: { [string]: { branch: string, slug: string } } = {}
+-- Toasts the answers `m` (the model of `host`) has to this window's create requests.
+local function check_created(cx: WindowCx, m: Model, host: string?)
+	for id, req in asked do
+		local c = m.created[id]
+		if req.host == host and type(c) == "table" then
+			asked[id] = nil
+			if c.ok then
+				cx:toast("success", "Pull request created for " .. req.branch, c.url)
+			else
+				cx:toast("error", "No pull request created for " .. req.branch, c.error)
+			end
+		end
+	end
+end
 
 -- Re-reads gh.json (called by the scan when status.json's `gh_sig` changed). A missing or half-written file keeps the
 -- last model.
@@ -37,34 +59,40 @@ local function load_gh(cx: WindowCx?)
 		return
 	end
 	local dok, doc = pcall(tern.json.decode, text)
-	if not dok or type(doc) ~= "table" or doc.version ~= gh.VERSION then
+	local m = if dok then model_of(doc) else nil
+	if m == nil then
 		return
 	end
-	S.gh = {
-		me = if type(doc.me) == "string" then doc.me else nil,
-		repos = if type(doc.repos) == "table" then doc.repos else {},
-		dirs = if type(doc.dirs) == "table" then doc.dirs else {},
-		created = if type(doc.created) == "table" then doc.created else {},
-	} :: Model
+	S.gh = m
 	S.dirty = true
 	S.redraw_soon()
 	if cx then
-		for id, req in asked do
-			local c = (S.gh :: Model).created[id]
-			if type(c) == "table" then
-				asked[id] = nil
-				if c.ok then
-					cx:toast("success", "Pull request created for " .. req.branch, c.url)
-				else
-					cx:toast("error", "No pull request created for " .. req.branch, c.error)
-				end
-			end
-		end
+		check_created(cx, m, nil)
 	end
 end
 
-local function repo_of(dir: string?): (string?, gh.Repo?)
-	local m: Model? = S.gh
+-- A remote host's gh node changed (remote.luau).
+local function gh_remote(cx: WindowCx, host: string)
+	local R = S.remote[host]
+	local m = if R then model_of(R.gh) else nil
+	if m == nil then
+		return
+	end
+	remote_models[host] = m
+	S.dirty = true
+	S.redraw_soon()
+	check_created(cx, m, host)
+end
+
+-- The model of `host` (nil: this machine's), nil when none was read or the host is gone.
+local function model_for(host: string?): Model?
+	if host == nil then
+		return S.gh
+	end
+	return if S.remote[host] then remote_models[host :: string] else nil
+end
+
+local function repo_in(m: Model?, dir: string?): (string?, gh.Repo?)
 	if m == nil or dir == nil then
 		return nil, nil
 	end
@@ -74,6 +102,21 @@ local function repo_of(dir: string?): (string?, gh.Repo?)
 	end
 	local r = m.repos[slug]
 	return slug, if type(r) == "table" then r else nil
+end
+
+-- The repository of folder `dir`: this machine's model first, then each remote host's (folders of different hosts
+-- hardly ever share a path).
+local function repo_of(dir: string?): (string?, gh.Repo?)
+	local slug, r = repo_in(S.gh, dir)
+	if slug == nil and dir ~= nil then
+		for host in S.remote do
+			slug, r = repo_in(remote_models[host], dir)
+			if slug then
+				break
+			end
+		end
+	end
+	return slug, r
 end
 
 -- The PR badge of a card working in `dir` on `branch`, and whether it is stale.
@@ -93,9 +136,9 @@ local function pr_for(dir: string?, branch: string?): (gh.Pr?, boolean?)
 	return pr, gh.stale(repo, os.time())
 end
 
--- A project's "PRs & issues" for the sidebar; nil outside GitHub.
+-- A project's "PRs & issues" for the sidebar, from its host's model; nil outside GitHub.
 local function gh_project(p: model.Project): sidebar.GhSnap?
-	local slug, r = repo_of(p.root)
+	local slug, r = repo_in(model_for(p.host), p.root)
 	if slug == nil then
 		return nil
 	end
@@ -128,8 +171,21 @@ local function open_url(cx: WindowCx, url: string)
 	end)
 end
 
+-- Refreshes `slug` on every host whose model has it (a repository cloned on two hosts is polled by both), this
+-- machine when none has.
 local function gh_refresh(cx: WindowCx, slug: string)
-	spool_write({ op = "gh_refresh", repo = slug })
+	local any = false
+	for host in S.remote do
+		local m = remote_models[host]
+		if m and m.repos[slug] then
+			core.spool_on(S, host, { op = "gh_refresh", repo = slug })
+			any = true
+		end
+	end
+	local m: Model? = S.gh
+	if not any or (m and m.repos[slug]) then
+		core.spool_on(S, nil, { op = "gh_refresh", repo = slug })
+	end
 	-- Shows "refreshing…" once the host starts (within its 5 s clock and the 15 s floor).
 	cx:toast("info", "Refreshing " .. slug)
 end
@@ -148,9 +204,10 @@ local function create_pr(cx: WindowCx)
 		return
 	end
 	local cwd = S.cwd_of(pane)
+	local host: string? = S.agent_host(cx, pane)
 	local r = if cwd then S.host_repos[cwd :: string] else nil
 	local branch = if type(r) == "table" and type(r.branch) == "string" then r.branch else nil
-	local slug, repo = repo_of(cwd)
+	local slug, repo = repo_in(model_for(host), cwd)
 	if cwd == nil or branch == nil then
 		cx:toast("error", "No branch", "The focused agent's folder is not on a git branch")
 		return
@@ -176,14 +233,15 @@ local function create_pr(cx: WindowCx)
 			return
 		end
 		local id = string.format("c%d-%04x", os.time(), math.random(0, 0xffff))
-		asked[id] = { branch = branch :: string, slug = slug :: string }
-		spool_write({ op = "gh_create", id = id, cwd = cwd, branch = branch, repo = slug })
+		asked[id] = { branch = branch :: string, slug = slug :: string, host = host }
+		core.spool_on(S, host, { op = "gh_create", id = id, cwd = cwd, branch = branch, repo = slug })
 	end)
 end
 
 return function(ctx: core.Ctx)
 	S = ctx
 	S.gh = nil
+	S.gh_remote = gh_remote
 	S.gh_sig = nil
 	S.load_gh = load_gh
 	S.pr_for = pr_for

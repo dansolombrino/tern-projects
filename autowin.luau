@@ -7,17 +7,22 @@
 --
 -- Every request to the host goes through the spool (`auto_*` ops); the host is the only writer of the state and of
 -- automations.json, except the empty template this half writes when the file does not exist yet.
+--
+-- Remote hosts' automations (their bridge's autos node, remote.luau) show after this machine's, each row tagged
+-- with its host (sidebar id `<host>|<id>`); their requests go to that host. A remote pane run is started only by
+-- that host's leader window while that host is current (its pane ids are the host's: mapped both ways); otherwise
+-- the host runs it headless after its 20 s wait.
 
 local core = require("./core")
 local model = require("./model")
 local sched = require("./sched")
 local budget = require("./budget")
 local sidebar = require("./sidebar")
+local rp = require("./remotepure")
 
 local S: core.Ctx = nil :: any
 
 local DATA = tern.plugin.data
-local SPOOL = DATA .. "/spool"
 local VIEW = DATA .. "/autos.json"
 local SIGFILE = DATA .. "/autos.sig"
 local FILE = DATA .. "/automations.json"
@@ -36,42 +41,99 @@ local TEMPLATE = [[{
 }
 ]]
 
-local spool_seq = 0
-local function spool_write(obj: { [string]: any })
-	spool_seq += 1
-	local name = string.format("%012d-%06d-%04x.json", os.time(), spool_seq, math.random(0, 0xffff))
-	pcall(tern.fs.mkdir, SPOOL)
-	tern.fs.write(SPOOL .. "/" .. name, tern.json.encode(obj))
-end
-
--- Pane runs this window started (run id → true) and runs whose agent was seen working.
+-- Pane runs this window started and runs whose agent was seen working, by `rp.join_id(host, run)`.
 local started: { [string]: boolean } = {}
 local seen_working: { [string]: boolean } = {}
--- Runs this window already reported finished.
+-- Runs this window already reported finished (same keys).
 local reported: { [string]: boolean } = {}
 local starting = false
 -- Sessions this window made for pane runs, until their first shell is closed.
 local fresh: { [number]: boolean } = {}
 
-local function view(): { [string]: any }?
-	return S.autos
+-- The model of `host` (nil: this machine's).
+local function view_of(host: string?): { [string]: any }?
+	if host == nil then
+		return S.autos
+	end
+	local R = S.remote[host]
+	local v = if R then R.autos else nil
+	return if type(v) == "table" and v.version == 1 then v else nil
 end
 
-local function auto_of(id: string): { [string]: any }?
-	local v = view()
-	if v == nil then
+-- Every model shown, this machine's first.
+local function views(): { { host: string?, v: { [string]: any } } }
+	local out = {}
+	if S.autos then
+		table.insert(out, { host = nil, v = S.autos })
+	end
+	for host in S.remote do
+		local v = view_of(host)
+		if v then
+			table.insert(out, { host = host, v = v })
+		end
+	end
+	return out
+end
+
+-- Whether this window starts and watches `host`'s pane runs: the mail leader here; that host's leader while it is
+-- the current host there.
+local function runs_here(host: string?): boolean
+	if host == nil then
+		return S.mail_leader()
+	end
+	local R = S.remote[host]
+	return R ~= nil and R.current and S.remote_leader(host)
+end
+
+-- A model's pane id as this window's.
+local function wp(host: string?, pane: any): number?
+	if type(pane) ~= "number" then
 		return nil
+	end
+	return if host then S.wpane(host, pane) else pane
+end
+
+-- The automation a sidebar id names, and its host.
+local function auto_of(sid: string): ({ [string]: any }?, string?)
+	local host, id = rp.split_id(sid)
+	local v = view_of(host)
+	if v == nil then
+		return nil, host
 	end
 	for _, a in v.autos or {} do
 		if a.id == id then
-			return a
+			return a, host
 		end
 	end
-	return nil
+	return nil, host
 end
 
 local start_pending: (cx: WindowCx) -> ()
 local reconcile: (cx: WindowCx) -> ()
+
+-- Forgets pane runs of `host` this window started once its model no longer lists them.
+local function forget_started(host: string?, doc: { [string]: any })
+	for key in started do
+		local khost, id = rp.split_id(key)
+		if khost == host then
+			local still = false
+			for _, p in doc.pending or {} do
+				if p.run == id then
+					still = true
+				end
+			end
+			for _, p in doc.panes or {} do
+				if p.run == id then
+					still = true
+				end
+			end
+			if not still then
+				started[key] = nil
+				seen_working[key] = nil
+			end
+		end
+	end
+end
 
 -- Re-reads autos.json (when its signature changed). A missing or half-written file keeps the last model.
 local function load_autos()
@@ -86,24 +148,22 @@ local function load_autos()
 	S.autos = doc
 	S.dirty = true
 	S.redraw_soon()
-	for id in started do
-		local still = false
-		for _, p in doc.pending or {} do
-			if p.run == id then
-				still = true
-			end
-		end
-		for _, p in doc.panes or {} do
-			if p.run == id then
-				still = true
-			end
-		end
-		if not still then
-			started[id] = nil
-			seen_working[id] = nil
-		end
-	end
+	forget_started(nil, doc)
 	if S.mail_leader() and #(doc.pending or {}) > 0 and not starting then
+		budget.later("auto start", 0, start_pending)
+	end
+end
+
+-- A remote host's autos node changed (remote.luau).
+local function autos_remote(host: string)
+	local v = view_of(host)
+	if v == nil then
+		return
+	end
+	S.dirty = true
+	S.redraw_soon()
+	forget_started(host, v)
+	if runs_here(host) and #(v.pending or {}) > 0 and not starting then
 		budget.later("auto start", 0, start_pending)
 	end
 end
@@ -118,9 +178,19 @@ local function wake()
 			load_autos()
 		end)
 	end
-	local v = view()
-	if v and S.mail_leader() and #(v.panes or {}) > 0 then
-		budget.later("auto reconcile", 0, reconcile)
+	for _, e in views() do
+		if runs_here(e.host) and #(e.v.panes or {}) > 0 then
+			budget.later("auto reconcile", 0, reconcile)
+			break
+		end
+	end
+	-- A remote pending run waits for its host to be current: look again now and then.
+	for host in S.remote do
+		local v = view_of(host)
+		if v and #(v.pending or {}) > 0 and runs_here(host) and not starting then
+			budget.later("auto start", 0, start_pending)
+			break
+		end
 	end
 end
 
@@ -138,26 +208,35 @@ end
 -- Starts the oldest pending pane run's agent: in its session, without taking the user's view. Steps: make sure the
 -- session exists (creating one switches to it: switch back), start the agent as a tab of the current session,
 -- tell the host (same callback: a reload never starts it twice), then move it to its session and give focus back.
+-- A remote host's run starts only while that host is current (sessions and agents start on the current host).
 start_pending = function(cx: WindowCx)
-	local v = view()
-	if v == nil or not S.mail_leader() then
-		return
-	end
 	local now = os.time()
 	local p: { [string]: any }? = nil
-	for _, it in v.pending or {} do
-		if not started[it.run] and type(it.deadline) == "number" and it.deadline - now > MARGIN then
-			p = it
+	local host: string? = nil
+	for _, e in views() do
+		if runs_here(e.host) then
+			for _, it in e.v.pending or {} do
+				if not started[rp.join_id(e.host, it.run)] and type(it.deadline) == "number" and it.deadline - now > MARGIN then
+					p = it
+					host = e.host
+					break
+				end
+			end
+		end
+		if p then
 			break
 		end
 	end
 	if p == nil then
 		return
 	end
+	if host and core.host_now(cx) ~= host then
+		return
+	end
 	local run = p :: { [string]: any }
 	local name = session_for(run)
 	local cur = cx.sessions:current()
-	local target = core.session_named(cx, name)
+	local target = core.session_named(cx, name, host)
 	if target == nil then
 		-- Creating a session switches to it: switch back on the next turn, then start.
 		starting = true
@@ -175,7 +254,7 @@ start_pending = function(cx: WindowCx)
 		return
 	end
 	local focused = cx.session:focused()
-	started[run.run] = true
+	started[rp.join_id(host, run.run)] = true
 	local ok, pane = pcall(function()
 		return cx.agents:start({
 			prompt = run.prompt,
@@ -185,11 +264,12 @@ start_pending = function(cx: WindowCx)
 		})
 	end)
 	if not ok then
-		spool_write({ op = "auto_start_failed", run = run.run, error = tostring(pane) })
+		core.spool_on(S, host, { op = "auto_start_failed", run = run.run, error = tostring(pane) })
 		return
 	end
-	spool_write({ op = "auto_started", run = run.run, pane = pane })
-	tern.log.info("projects: automation pane run started", run.run, pane)
+	-- The host knows its panes by its own ids.
+	core.spool_on(S, host, { op = "auto_started", run = run.run, pane = if host then S.remote_hpane(host, pane) else pane })
+	tern.log.info("projects: automation pane run started", run.run, pane, host)
 	local title = string.format("⏱ %s #%d", run.name, run.n)
 	-- Its card in the project: a record titled after the automation.
 	if type(run.project) == "string" then
@@ -234,12 +314,13 @@ start_pending = function(cx: WindowCx)
 		end
 		-- Orca's terminal retention: an automation keeps its latest run's pane; older finished ones close
 		-- (unless focused or working again).
-		local a = auto_of(run.auto)
+		local a = auto_of(rp.join_id(host, run.auto))
 		for _, r in (if a then a.runs else nil) or {} do
-			local b = if type(r.pane) == "number" then S.blocks[r.pane] else nil
-			if r.mode == "pane" and b and r.pane ~= pane and r.pane ~= focused and not sidebar.auto_active(r.status) and b.state ~= "working" then
+			local rpane = wp(host, r.pane)
+			local b = if rpane then S.blocks[rpane :: number] else nil
+			if r.mode == "pane" and b and rpane ~= pane and rpane ~= focused and not sidebar.auto_active(r.status) and b.state ~= "working" then
 				pcall(function()
-					mcx.agents:stop(r.pane)
+					mcx.agents:stop(rpane :: number)
 				end)
 			end
 		end
@@ -258,20 +339,21 @@ start_pending = function(cx: WindowCx)
 	end)
 end
 
-local function finished(run: string, result: string, text: string?)
-	if reported[run] then
+local function finished(host: string?, run: string, result: string, text: string?)
+	local key = rp.join_id(host, run)
+	if reported[key] then
 		return
 	end
-	reported[run] = true
-	spool_write({ op = "auto_finished", run = run, result = result, text = text })
+	reported[key] = true
+	core.spool_on(S, host, { op = "auto_finished", run = run, result = result, text = text })
 end
 
 -- Whether a pane run's turn is over, from its transcript (one read, in a callback of its own): its last message is
 -- the answer to the run's prompt. A new omp's own start-up can report a turn end (and idle) before the prompt is
 -- even sent, so state alone is not enough. An agent idle with no answer IDLE_DONE after the run started is done
--- too (with no summary).
-local function check_done(pane: number, run: string, started: number?, result: string)
-	if reported[run] then
+-- too (with no summary). `pane` is this window's id.
+local function check_done(host: string?, pane: number, run: string, started: number?, result: string)
+	if reported[rp.join_id(host, run)] then
 		return
 	end
 	budget.later("auto result", 0, function(rcx)
@@ -280,34 +362,33 @@ local function check_done(pane: number, run: string, started: number?, result: s
 		end)
 		local last = if ok and #msgs > 0 then msgs[#msgs] else nil
 		if last and last.role == "assistant" and not core.blank(last.text) then
-			finished(run, result, last.text)
+			finished(host, run, result, last.text)
 		elseif started and os.time() - started > IDLE_DONE then
-			finished(run, result, nil)
+			finished(host, run, result, nil)
 		end
 	end)
 end
 
 -- A pane run's agent ended its turn (window.luau's agent_finished).
 local function on_finished(pane: number, result: string)
-	local v = view()
-	if v == nil then
-		return
-	end
-	for _, p in v.panes or {} do
-		if p.pane == pane then
-			check_done(pane, p.run, p.started, if result == "failed" then "failed" else "done")
+	for _, e in views() do
+		for _, p in e.v.panes or {} do
+			if wp(e.host, p.pane) == pane then
+				check_done(e.host, pane, p.run, p.started, if result == "failed" then "failed" else "done")
+			end
 		end
 	end
 end
 
 local function on_state(pane: number, new: string)
-	local v = view()
-	if v == nil or new ~= "working" then
+	if new ~= "working" then
 		return
 	end
-	for _, p in v.panes or {} do
-		if p.pane == pane then
-			seen_working[p.run] = true
+	for _, e in views() do
+		for _, p in e.v.panes or {} do
+			if wp(e.host, p.pane) == pane then
+				seen_working[rp.join_id(e.host, p.run)] = true
+			end
 		end
 	end
 end
@@ -315,8 +396,13 @@ end
 -- The leader's check of running pane runs (an agent_finished missed while reloading, or in no window): an agent
 -- now idle after it worked (or long after it started) may have finished its turn: its transcript says.
 reconcile = function(cx: WindowCx)
-	local v = view()
-	if v == nil or #(v.panes or {}) == 0 then
+	local todo = {}
+	for _, e in views() do
+		if runs_here(e.host) and #(e.v.panes or {}) > 0 then
+			table.insert(todo, e)
+		end
+	end
+	if #todo == 0 then
 		return
 	end
 	local ok, list = pcall(function()
@@ -330,14 +416,18 @@ reconcile = function(cx: WindowCx)
 		by[b.pane] = b
 	end
 	local now = os.time()
-	for _, p in v.panes do
-		local b = by[p.pane]
-		if b then
-			if b.state == "working" then
-				seen_working[p.run] = true
-			elseif b.state == "idle" or b.state == "exited" then
-				if seen_working[p.run] or (type(p.started) == "number" and now - p.started > IDLE_DONE) then
-					check_done(p.pane, p.run, p.started, "done")
+	for _, e in todo do
+		for _, p in e.v.panes do
+			local pane = wp(e.host, p.pane)
+			local b = if pane then by[pane :: number] else nil
+			local key = rp.join_id(e.host, p.run)
+			if b then
+				if b.state == "working" then
+					seen_working[key] = true
+				elseif b.state == "idle" or b.state == "exited" then
+					if seen_working[key] or (type(p.started) == "number" and now - p.started > IDLE_DONE) then
+						check_done(e.host, pane :: number, p.run, p.started, "done")
+					end
 				end
 			end
 		end
@@ -347,39 +437,50 @@ end
 -- Sidebar --------------------------------------------------------------------------
 
 local function snap(): sidebar.AutoSnap?
-	local v = view()
 	local ui = S.ui
 	local list: { sidebar.AutoRow } = {}
+	local errors: { string } = {}
 	local running = 0
-	for _, a in (if v then v.autos else nil) or {} do
-		local runs = a.runs or {}
-		local active: { [string]: any }? = nil
-		local last: { [string]: any }? = nil
-		-- Newest first: the active run (at most one per automation) and the latest finished one.
-		for _, r in runs do
-			if sidebar.auto_active(r.status) then
-				active = active or r
-			else
-				last = last or r
+	local all = views()
+	if #all == 0 then
+		all = { { host = nil, v = {} :: { [string]: any } } }
+	end
+	for _, e in all do
+		local v = e.v
+		local tag = if e.host then " · " .. (model.host_short(e.host) or e.host :: string) else ""
+		for _, a in v.autos or {} do
+			local runs = a.runs or {}
+			local active: { [string]: any }? = nil
+			local last: { [string]: any }? = nil
+			-- Newest first: the active run (at most one per automation) and the latest finished one.
+			for _, r in runs do
+				if sidebar.auto_active(r.status) then
+					active = active or r
+				else
+					last = last or r
+				end
 			end
+			if active then
+				running += 1
+			end
+			table.insert(list, {
+				id = rp.join_id(e.host, a.id),
+				name = a.name .. tag,
+				enabled = a.enabled == true,
+				label = a.label,
+				run_in = a.run_in,
+				next_at = a.next_at,
+				active = active,
+				last = last,
+			})
 		end
-		if active then
-			running += 1
+		for _, err in v.errors or {} do
+			table.insert(errors, if e.host then (model.host_short(e.host) or e.host :: string) .. ": " .. err else err)
 		end
-		table.insert(list, {
-			id = a.id,
-			name = a.name,
-			enabled = a.enabled == true,
-			label = a.label,
-			run_in = a.run_in,
-			next_at = a.next_at,
-			active = active,
-			last = last,
-		})
 	end
 	return {
 		list = list,
-		errors = if v then v.errors or {} else {},
+		errors = errors,
 		open = not ui.collapsed.automations,
 		running = running,
 	}
@@ -387,42 +488,56 @@ end
 
 -- Actions ----------------------------------------------------------------------------
 
-local function run_now(cx: WindowCx, id: string)
-	local a = auto_of(id)
-	spool_write({ op = "auto_run", id = id })
+local function run_now(cx: WindowCx, sid: string)
+	local a, host = auto_of(sid)
+	local _, id = rp.split_id(sid)
+	core.spool_on(S, host, { op = "auto_run", id = id })
 	cx:toast("info", "Running " .. (if a then a.name else id) .. " now")
 end
 
-local function toggle(cx: WindowCx, id: string)
-	local a = auto_of(id)
+local function toggle(cx: WindowCx, sid: string)
+	local a, host = auto_of(sid)
 	if a == nil then
 		return
 	end
-	spool_write({ op = "auto_enable", id = id, enabled = not a.enabled })
+	core.spool_on(S, host, { op = "auto_enable", id = a.id, enabled = not a.enabled })
 	cx:toast("info", (if a.enabled then "Paused " else "Enabled ") .. a.name)
 end
 
-local function open_run(cx: WindowCx, r: { [string]: any })
-	if r.mode == "pane" and type(r.pane) == "number" and S.blocks[r.pane] then
-		S.goto_pane(cx, r.pane)
+-- Opens a file of `host` (nil: this machine) in a Tern tab; a remote file opens only while its host is current
+-- (Tern opens paths on the current host).
+local function open_file(cx: WindowCx, host: string?, path: string)
+	if host == nil then
+		cx.docs:open(path, { how = "tab" })
+	elseif core.host_now(cx) == host then
+		cx:open(path)
+	else
+		cx:toast("info", "Switch to " .. (model.host_short(host) or host :: string) .. " first", path)
+	end
+end
+
+local function open_run(cx: WindowCx, r: { [string]: any }, host: string?)
+	local pane = wp(host, r.pane)
+	if r.mode == "pane" and pane and S.blocks[pane :: number] then
+		S.goto_pane(cx, pane :: number)
 		return
 	end
-	if type(r.out) == "string" and tern.fs.exists(r.out) then
-		cx.docs:open(r.out, { how = "tab" })
+	if type(r.out) == "string" and (host ~= nil or tern.fs.exists(r.out)) then
+		open_file(cx, host, r.out)
 		return
 	end
 	cx:toast("info", "No output for run " .. tostring(r.id), r.summary)
 end
 
 -- Opens the latest run with output (a pane, or a headless run's output file).
-local function open_last(cx: WindowCx, id: string)
-	local a = auto_of(id)
+local function open_last(cx: WindowCx, sid: string)
+	local a, host = auto_of(sid)
 	if a == nil then
 		return
 	end
 	for _, r in a.runs or {} do
 		if r.out or r.pane then
-			open_run(cx, r)
+			open_run(cx, r, host)
 			return
 		end
 	end
@@ -434,8 +549,8 @@ local function when(t: number?): string
 end
 
 -- A run's history: pick one to open it (or stop it, while it runs).
-local function runs_picker(cx: WindowCx, id: string)
-	local a = auto_of(id)
+local function runs_picker(cx: WindowCx, sid: string)
+	local a, host = auto_of(sid)
 	if a == nil then
 		return
 	end
@@ -459,24 +574,25 @@ local function runs_picker(cx: WindowCx, id: string)
 	table.insert(items, { label = "Run now", icon = "rocket", now = true })
 	table.insert(items, { label = if a.enabled then "Pause (disable)" else "Enable", icon = "settings", toggle = true })
 	table.insert(items, { label = "Edit automations.json", icon = "doc", edit = true })
+	local where = if host then " · " .. (model.host_short(host) or host :: string) else ""
 	core.ask_pick(cx, {
 		items = items,
-		placeholder = string.format("%s · %s · %s", a.name, a.label, if a.enabled then "next " .. when(a.next_at) else "paused"),
+		placeholder = string.format("%s%s · %s · %s", a.name, where, a.label, if a.enabled then "next " .. when(a.next_at) else "paused"),
 		icon = "list",
 	}, function(item, pcx)
 		if item.now then
-			run_now(pcx, id)
+			run_now(pcx, sid)
 		elseif item.toggle then
-			toggle(pcx, id)
+			toggle(pcx, sid)
 		elseif item.edit then
-			S.auto_edit(pcx)
+			S.auto_edit(pcx, host)
 		elseif item.stop then
-			spool_write({ op = "auto_stop", run = item.stop })
+			core.spool_on(S, host, { op = "auto_stop", run = item.stop })
 			pcx:toast("info", "Stopping run " .. item.stop)
 		elseif item.run then
 			for _, r in a.runs or {} do
 				if r.id == item.run then
-					open_run(pcx, r)
+					open_run(pcx, r, host)
 				end
 			end
 		end
@@ -484,10 +600,12 @@ local function runs_picker(cx: WindowCx, id: string)
 end
 
 local function pick_auto(cx: WindowCx, placeholder: string, fn: (cx: WindowCx, id: string) -> ())
-	local v = view()
 	local items: { PickItem } = {}
-	for _, a in (if v then v.autos else nil) or {} do
-		table.insert(items, { label = a.name, detail = a.label .. (if a.enabled then "" else " · paused"), icon = "list", auto = a.id })
+	for _, e in views() do
+		local tag = if e.host then " · " .. (model.host_short(e.host) or e.host :: string) else ""
+		for _, a in e.v.autos or {} do
+			table.insert(items, { label = a.name, detail = a.label .. (if a.enabled then "" else " · paused") .. tag, icon = "list", auto = rp.join_id(e.host, a.id) })
+		end
 	end
 	if #items == 0 then
 		cx:toast("info", "No automations yet", "Projects: New automation")
@@ -498,15 +616,26 @@ local function pick_auto(cx: WindowCx, placeholder: string, fn: (cx: WindowCx, i
 	end)
 end
 
--- Opens the definitions file in a Tern document tab (writing the empty template first when it does not exist).
-local function edit_file(cx: WindowCx)
+-- Opens the definitions file in a Tern document tab (writing the empty template first when it does not exist). A
+-- remote host's file (the path its model names) opens while that host is current.
+local function edit_file(cx: WindowCx, host: string?)
+	if host then
+		local v = view_of(host)
+		local path = if v and type(v.file) == "string" then v.file else nil
+		if path == nil then
+			cx:toast("info", "No automations from " .. (model.host_short(host) or host :: string) .. " yet")
+			return
+		end
+		open_file(cx, host, path :: string)
+		return
+	end
 	if not tern.fs.exists(FILE) then
 		pcall(tern.fs.write, FILE, TEMPLATE)
 	end
 	cx.docs:open(FILE, { how = "tab" })
 end
 
--- New automation: name, schedule, prompt, where, how; the host appends it to automations.json.
+-- New automation: name, schedule, prompt, where, how; the host the place is on appends it to its automations.json.
 local function new_auto(cx: WindowCx)
 	core.ask_text(cx, { placeholder = "Automation name (e.g. Nightly review)", icon = "sparkle", action = "next" }, function(name, ncx)
 		local function ask_schedule(scx: WindowCx, value: string?)
@@ -527,11 +656,13 @@ local function new_auto(cx: WindowCx)
 					S.state = model.load()
 					local items: { PickItem } = {}
 					for _, p in S.state.projects do
-						table.insert(items, { label = p.name, detail = core.tilde(p.root), icon = "folder", project = p.id })
+						local tag = if p.host then " · " .. (model.host_short(p.host) or p.host :: string) else ""
+						table.insert(items, { label = p.name, detail = core.tilde(p.root) .. tag, icon = "folder", project = p.id, host = p.host })
 					end
-					local _, fcwd = core.focused_cwd(pcx)
+					local fpane, fcwd = core.focused_cwd(pcx)
 					if fcwd then
-						table.insert(items, { label = "Focused pane's folder", detail = core.tilde(fcwd :: string), icon = "folder-open", cwd = fcwd })
+						local fhost = if next(S.remote) ~= nil and fpane then core.host_of_pane(pcx, fpane :: number) else nil
+						table.insert(items, { label = "Focused pane's folder", detail = core.tilde(fcwd :: string), icon = "folder-open", cwd = fcwd, host = fhost })
 					end
 					if #items == 0 then
 						pcx:toast("error", "No project or folder", "Add a project or focus a pane in the folder first")
@@ -546,7 +677,7 @@ local function new_auto(cx: WindowCx)
 							placeholder = "How it runs",
 							icon = "agent",
 						}, function(how, hcx)
-							spool_write({
+							core.spool_on(S, where.host, {
 								op = "auto_create",
 								def = {
 									name = name,
@@ -573,6 +704,7 @@ return function(ctx: core.Ctx)
 	S.autos = nil
 	S.auto_sig = nil
 	S.load_autos = load_autos
+	S.autos_remote = autos_remote
 	S.auto_wake = wake
 	S.auto_snap = snap
 	S.auto_finished = on_finished

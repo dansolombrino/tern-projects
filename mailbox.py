@@ -3,13 +3,14 @@
 
 Two modes, standard library only:
 
-serve --data DIR [--socket PATH]
+serve --data DIR [--socket PATH] [--discovery PATH]
     Started by the plugin's host half with `tern.process.spawn`. Listens on a Unix stream socket (0600), one JSON
     request per line and connection, and relays each request to the host half as a line on stdout:
         {"t": "req", "n": <int>, "msg": <request>}
     The host answers on stdin with {"t": "reply", "n": <int>, "reply": {...}}, which goes back to the client before
     the connection closes. {"t": "notify"} on stdin tells every watcher the queue changed. Writes DIR/mailbox.json
-    once listening and removes it (when it still names this process) on exit. Exits when stdin closes: the plugin
+    (and the same file at each --discovery PATH, where scripts look when the data dir is elsewhere, as on Linux)
+    once listening and removes each (when it still names this process) on exit. Exits when stdin closes: the plugin
     was reloaded or unloaded, and its new host half starts a new helper.
 
 watch --data DIR
@@ -24,11 +25,13 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import select
 import signal
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -69,17 +72,55 @@ def default_socket(data: str) -> str:
     return os.path.join(base, "mailbox.sock")
 
 
+def private_dir(path: str) -> bool:
+    """Whether `path` is (or now is) a real directory of ours that only we can enter."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        if st.st_mode & 0o077:
+            os.chmod(path, 0o700)
+            st = os.lstat(path)
+        return st.st_mode & 0o777 == 0o700
+    except OSError:
+        return False
+
+
+def fallback_sockets(data: str) -> list[str]:
+    """Private places for the socket when the data dir's filesystem keeps no modes (a FUSE/NTFS mount answers 0777
+    whatever chmod says). Named after the data dir, so two helpers never share one."""
+    name = f"mailbox-{hashlib.sha1(os.path.realpath(data).encode()).hexdigest()[:12]}.sock"
+    bases = []
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        bases.append(os.path.join(os.environ["XDG_RUNTIME_DIR"], "tern-projects"))
+    bases.append(f"/tmp/tern-projects-{os.getuid()}")
+    bases.append(os.path.join(tempfile.gettempdir(), f"tern-projects-{os.getuid()}"))
+    out = []
+    for b in bases:
+        p = os.path.join(b, name)
+        if p not in out and len(p.encode()) <= MAX_SOCKET_PATH:
+            out.append(p)
+    return out
+
+
 class Server:
-    def __init__(self, data: str, path: str) -> None:
+    def __init__(self, data: str, path: str | None, extra: list[str] | None = None) -> None:
         self.data = data
-        self.path = path
+        # None: the default place, which may move to a private fallback (an explicit --socket never moves).
+        self.explicit = path is not None
+        self.path = path or default_socket(data)
         self.discovery = os.path.join(data, "mailbox.json")
+        # Every mailbox.json this helper publishes: the data dir's, then each --discovery one.
+        self.discoveries = [self.discovery] + [p for p in (extra or []) if os.path.abspath(p) != os.path.abspath(self.discovery)]
         self.out_lock = threading.Lock()
         self.lock = threading.Lock()
         self.next_n = 0
         self.waiting: dict[int, tuple[threading.Event, list]] = {}
         self.watchers: list[socket.socket] = []
         self.inode: int | None = None
+        # Said to the host after `ready`, the first line it reads.
+        self.moved: str | None = None
 
     # stdout to the host half, one JSON object per line.
     def emit(self, obj: dict) -> None:
@@ -207,39 +248,74 @@ class Server:
                 self.push({"event": "mail"})
 
     def cleanup(self) -> None:
-        try:
-            with open(self.discovery) as fh:
-                if json.load(fh).get("pid") == os.getpid():
-                    os.unlink(self.discovery)
-        except (OSError, ValueError, AttributeError):
-            pass
+        for path in self.discoveries:
+            try:
+                with open(path) as fh:
+                    if json.load(fh).get("pid") == os.getpid():
+                        os.unlink(path)
+            except (OSError, ValueError, AttributeError):
+                pass
         try:
             if self.inode is not None and os.stat(self.path).st_ino == self.inode:
                 os.unlink(self.path)
         except OSError:
             pass
 
-    def run(self) -> int:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+    def bind(self, path: str) -> socket.socket | None:
+        """A socket listening at `path` with mode 0600, or None when that filesystem cannot keep the mode."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
-            os.unlink(self.path)
+            os.unlink(path)
         except FileNotFoundError:
             pass
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         old = os.umask(0o177)
         try:
-            srv.bind(self.path)
+            srv.bind(path)
         finally:
             os.umask(old)
-        os.chmod(self.path, 0o600)
-        srv.listen(64)
-        self.inode = os.stat(self.path).st_ino
-        started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-        write_json_atomic(self.discovery, {"version": VERSION, "socket": self.path, "pid": os.getpid(), "started_at": started})
-        self.emit({"t": "ready", "socket": self.path, "pid": os.getpid()})
-        reader = threading.Thread(target=self.read_stdin, daemon=True)
-        reader.start()
+        os.chmod(path, 0o600)
+        if os.stat(path).st_mode & 0o777 != 0o600:
+            srv.close()
+            os.unlink(path)
+            return None
+        return srv
+
+    def listen(self) -> socket.socket:
+        srv = self.bind(self.path)
+        if srv is None and not self.explicit:
+            for path in fallback_sockets(self.data):
+                if private_dir(os.path.dirname(path)):
+                    srv = self.bind(path)
+                    if srv is not None:
+                        self.moved = f"{self.path}: that filesystem keeps no file modes; listening at {path}"
+                        self.path = path
+                        break
+        if srv is None:
+            raise SystemExit(f"mailbox: no place keeps the socket private (mode 0600): {self.path}")
+        return srv
+
+    def run(self) -> int:
+        srv = self.listen()
+        # From here on every exit (SIGTERM included, even one right after `ready`) goes through cleanup.
         try:
+            self.inode = os.stat(self.path).st_ino
+            srv.listen(64)
+            started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            info = {"version": VERSION, "socket": self.path, "pid": os.getpid(), "started_at": started}
+            write_json_atomic(self.discovery, info)
+            notes = [self.moved] if self.moved else []
+            for path in self.discoveries[1:]:
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    write_json_atomic(path, info)
+                except OSError as exc:
+                    notes.append(f"{path} not written: {exc}")
+            self.emit({"t": "ready", "socket": self.path, "pid": os.getpid()})
+            for note in notes:
+                self.log(note)
+            reader = threading.Thread(target=self.read_stdin, daemon=True)
+            reader.start()
             while reader.is_alive():
                 r, _, _ = select.select([srv], [], [], 0.5)
                 if not r:
@@ -319,6 +395,7 @@ def main() -> int:
     s = sub.add_parser("serve")
     s.add_argument("--data", required=True)
     s.add_argument("--socket")
+    s.add_argument("--discovery", action="append", default=[], help="also publish mailbox.json at this path")
     w = sub.add_parser("watch")
     w.add_argument("--data", required=True)
     args = ap.parse_args()
@@ -326,7 +403,7 @@ def main() -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(0))
     if args.mode == "serve":
-        return Server(args.data, args.socket or default_socket(args.data)).run()
+        return Server(args.data, args.socket, args.discovery).run()
     return watch(args.data)
 
 

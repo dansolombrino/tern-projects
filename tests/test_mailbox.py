@@ -116,6 +116,65 @@ class HelperTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.data, "mailbox.json")))
 
 
+class DiscoveryTest(unittest.TestCase):
+    """--discovery: the same mailbox.json where agent-fleet scripts look when the data dir is elsewhere (Linux)."""
+
+    def start(self) -> subprocess.Popen:
+        p = subprocess.Popen(
+            [sys.executable, HELPER, "serve", "--data", self.data, "--discovery", self.extra],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+        )
+        self.procs.append(p)
+        self.assertEqual(json.loads(p.stdout.readline())["t"], "ready")
+        return p
+
+    def setUp(self) -> None:
+        self.data = tempfile.mkdtemp(prefix="tp-")
+        # A folder that does not exist yet: the helper makes it.
+        self.extra = os.path.join(tempfile.mkdtemp(prefix="tc-"), "plugin-data", "projects", "mailbox.json")
+        self.procs: list[subprocess.Popen] = []
+
+    def tearDown(self) -> None:
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            for f in (p.stdin, p.stdout):
+                if f and not f.closed:
+                    f.close()
+
+    def read(self, path: str) -> dict:
+        with open(path) as fh:
+            return json.load(fh)
+
+    def test_extra_file_matches_and_goes_on_stop(self) -> None:
+        p = self.start()
+        primary = self.read(os.path.join(self.data, "mailbox.json"))
+        self.assertEqual(self.read(self.extra), primary)
+        self.assertEqual(primary["pid"], p.pid)
+        self.assertEqual(os.stat(primary["socket"]).st_mode & 0o777, 0o600)
+        p.stdin.close()
+        p.wait(15)
+        self.assertFalse(os.path.exists(self.extra))
+        self.assertFalse(os.path.exists(os.path.join(self.data, "mailbox.json")))
+
+    def test_restart_replaces_and_stop_spares_another_helpers_file(self) -> None:
+        first = self.start()
+        # A killed helper leaves its files; the next one replaces them.
+        first.kill()
+        first.wait(5)
+        self.assertEqual(self.read(self.extra)["pid"], first.pid)
+        second = self.start()
+        self.assertEqual(self.read(self.extra)["pid"], second.pid)
+        # Another helper took the extra file over: stopping this one leaves it.
+        with open(self.extra, "w") as fh:
+            json.dump({"version": 1, "socket": "/nowhere", "pid": 1}, fh)
+        second.terminate()
+        second.wait(5)
+        self.assertEqual(self.read(self.extra)["pid"], 1)
+        self.assertFalse(os.path.exists(os.path.join(self.data, "mailbox.json")))
+
+
 class WatchTest(unittest.TestCase):
     def test_watch_without_helper_says_so_and_ticks(self) -> None:
         data = tempfile.mkdtemp(prefix="tp-")

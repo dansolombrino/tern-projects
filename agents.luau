@@ -15,7 +15,10 @@ local defer = core.defer
 local ensure_session = core.ensure_session
 local errtext = core.errtext
 local focused_cwd = core.focused_cwd
-local git = core.git
+local fs_on = core.fs_on
+local git_on = core.git_on
+local host_of_pane = core.host_of_pane
+local host_record = core.host_record
 local key_of = core.key_of
 local plural = core.plural
 local session_of = core.session_of
@@ -25,6 +28,40 @@ local trimmed = core.trimmed
 
 -- The context: all shared state and the other modules' functions, set by the installer below.
 local S: core.Ctx = nil :: any
+
+-- The host an agent's folder is on: its project's, else the host running its pane (nil: this machine).
+local function host_for(cx: WindowCx, pane: number, project: model.Project?): string?
+	if project then
+		return project.host
+	end
+	return if pane > 0 then host_of_pane(cx, pane) else nil
+end
+
+-- Whether `path` exists on `host`; `fn` gets a window context: the caller's when the answer came at once (this
+-- machine, so local use keeps its single turn), the reply's, else the next turn's. `err` when it couldn't check.
+local function exists_on(cx: WindowCx, host: string?, path: string, fn: (found: boolean, err: string?, cx: WindowCx) -> ())
+	local sync = true
+	fs_on(S, host, "exists", path, function(ok, value, err, _, rcx)
+		local found = ok and value == true
+		local why = if ok then nil else err or "not checked"
+		if sync then
+			fn(found, why, cx)
+		elseif rcx then
+			fn(found, why, rcx)
+		else
+			defer(function(dcx)
+				fn(found, why, dcx)
+			end)
+		end
+	end)
+	sync = false
+end
+
+-- The host agent `pane`'s folder is on (its record's project's, else where its pane runs).
+local function agent_host(cx: WindowCx, pane: number): string?
+	local meta = S.meta_of(pane)
+	return host_for(cx, pane, if meta then model.get(S.state, meta.project) else nil)
+end
 
 -- Shows and focuses `pane`, switching session when another one holds it; it is read now.
 local function goto_pane(cx: WindowCx, pane: number)
@@ -39,13 +76,13 @@ end
 
 -- The record key of agent `pane`, creating a record for an agent started by hand (named after its folder, under
 -- the project its folder belongs to, if any); leaves `S.state` loaded and saved.
-local function ensure_record(pane: number, cwd: string?): string
+local function ensure_record(cx: WindowCx, pane: number, cwd: string?): string
 	S.state = model.load()
 	local key = S.pane_key[pane]
 	if key and S.state.agents[key :: string] then
 		return key :: string
 	end
-	local p = model.project_for_path(S.state, cwd)
+	local p = model.project_for_path(S.state, cwd, if pane > 0 then host_of_pane(cx, pane) else nil)
 	local nkey = model.new_key()
 	S.state.agents[nkey] = { project = if p then p.id else "", title = S.title_of(pane, cwd), started = 0, pane = pane, cwd = cwd }
 	model.save(S.state)
@@ -115,7 +152,16 @@ local function start_agent(cx: WindowCx, s: Start, started: (pane: number, cx: W
 		goto_pane(cx, s.parent :: number)
 		how = "split"
 	else
-		created = ensure_session(cx, s.project)
+		local ok, id = pcall(ensure_session, cx, s.project)
+		if not ok then
+			-- Its host is not connected: nothing starts in the wrong place.
+			cx:toast("error", "Agent not started", tostring(id))
+			if failed then
+				failed()
+			end
+			return
+		end
+		created = id
 	end
 	local switches = 0
 	local function start_step(scx: WindowCx)
@@ -236,21 +282,21 @@ end
 type GitSetup = { prefix: string?, base: string }
 
 -- Orca's branch prefix (`github.user`, else `user.username`, else none) and base ref (origin/HEAD's target,
--- origin/main, origin/master, main, master, else HEAD), one git call per callback.
-local function git_setup(root: string, done: (setup: GitSetup, cx: WindowCx?) -> ())
+-- origin/main, origin/master, main, master, else HEAD), one git call per callback, on the project's host.
+local function git_setup(host: string?, root: string, done: (setup: GitSetup, cx: WindowCx?) -> ())
 	local function base_of(prefix: string?)
-		git({ "-C", root, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD" }, function(res, _)
+		git_on(S, host, { "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD" }, function(res, _)
 			local head = trimmed(res.stdout)
 			if res.status == 0 and head ~= "" then
 				done({ prefix = prefix, base = head }, nil)
 				return
 			end
 			local wanted = { "refs/remotes/origin/main", "refs/remotes/origin/master", "refs/heads/main", "refs/heads/master" }
-			local args = { "-C", root, "for-each-ref", "--format=%(refname)" }
+			local args = { "for-each-ref", "--format=%(refname)" }
 			for _, r in wanted do
 				table.insert(args, r)
 			end
-			git(args, function(fres, fcx)
+			git_on(S, host, args, function(fres, fcx)
 				local have: { [string]: boolean } = {}
 				for line in string.gmatch(fres.stdout, "[^\n]+") do
 					have[trimmed(line)] = true
@@ -263,40 +309,46 @@ local function git_setup(root: string, done: (setup: GitSetup, cx: WindowCx?) ->
 					end
 				end
 				done({ prefix = prefix, base = "HEAD" }, fcx)
-			end)
-		end)
+			end, nil, root)
+		end, nil, root)
 	end
-	git({ "-C", root, "config", "github.user" }, function(res, _)
+	git_on(S, host, { "config", "github.user" }, function(res, _)
 		local user = trimmed(res.stdout)
 		if res.status == 0 and user ~= "" then
 			base_of(user)
 			return
 		end
-		git({ "-C", root, "config", "user.username" }, function(ures, _)
+		git_on(S, host, { "config", "user.username" }, function(ures, _)
 			local u = trimmed(ures.stdout)
 			base_of(if ures.status == 0 and u ~= "" then u else nil)
-		end)
-	end)
+		end, nil, root)
+	end, nil, root)
 end
 
--- Creates worktree `<name>` (then `<name>-2`, … when taken) on a new branch from the base ref.
+-- Creates worktree `<name>` (then `<name>-2`, … when taken) on a new branch from the base ref, on the project's host.
 local function make_worktree(project: model.Project, setup: GitSetup, name: string, n: number, done: (path: string?, branch: string?, err: string?) -> ())
 	local slug = if n == 1 then name else name .. "-" .. n
 	local path = model.worktree_path(project, slug)
 	local branch = model.branch_name(setup.prefix, slug)
-	if tern.fs.exists(path) then
-		make_worktree(project, setup, name, n + 1, done)
-		return
-	end
-	git({ "-C", project.root, "worktree", "add", "--no-track", "-b", branch, path, setup.base }, function(res, _)
-		if res.status == 0 then
-			done(path, branch, nil)
-		elseif n < 20 and string.find(res.stderr, "already exists", 1, true) then
-			make_worktree(project, setup, name, n + 1, done)
-		else
-			done(nil, nil, errtext(res))
+	fs_on(S, project.host, "exists", path, function(ok, taken, err, _, _)
+		if not ok then
+			done(nil, nil, err)
+			return
 		end
-	end, 120000)
+		if taken then
+			make_worktree(project, setup, name, n + 1, done)
+			return
+		end
+		git_on(S, project.host, { "worktree", "add", "--no-track", "-b", branch, path, setup.base }, function(res, _)
+			if res.status == 0 then
+				done(path, branch, nil)
+			elseif n < 20 and string.find(res.stderr, "already exists", 1, true) then
+				make_worktree(project, setup, name, n + 1, done)
+			else
+				done(nil, nil, errtext(res))
+			end
+		end, 120000, project.root)
+	end)
 end
 
 local function new_agent_in(cx: WindowCx, project: model.Project)
@@ -305,7 +357,7 @@ local function new_agent_in(cx: WindowCx, project: model.Project)
 			launch(pcx, { project = project, task = task, cwd = project.root })
 			return
 		end
-		git_setup(project.root, function(setup)
+		git_setup(project.host, project.root, function(setup)
 			make_worktree(project, setup, model.slug(model.title_of(task)), 1, function(path, branch, err)
 				defer(function(wcx)
 					if path == nil then
@@ -328,7 +380,8 @@ local function pick_project(cx: WindowCx, placeholder: string, fn: (cx: WindowCx
 	local current = cx.sessions:current().name
 	local items: { PickItem } = {}
 	for _, p in S.state.projects do
-		table.insert(items, { label = p.name, detail = tilde(p.root), icon = "folder", current = p.name == current, project = p.id })
+		local on = model.host_short(p.host)
+		table.insert(items, { label = p.name, detail = if on then on .. " · " .. p.root else tilde(p.root), icon = "folder", current = p.name == current, project = p.id })
 	end
 	ask_pick(cx, { items = items, placeholder = placeholder, icon = "folder" }, function(item, pcx)
 		local p = model.get(model.load(), (item :: any).project)
@@ -374,7 +427,7 @@ local function new_subagent_of(cx: WindowCx, parent: number)
 	local ptitle = S.title_of(parent, b.cwd)
 	ask_text(cx, { placeholder = "Task for a subagent of " .. ptitle, icon = "sparkle", action = "start subagent" }, function(task, pcx)
 		-- The child's record names its parent by record key: an agent started by hand gets a record first.
-		ensure_record(parent, b.cwd)
+		ensure_record(pcx, parent, b.cwd)
 		launch(pcx, {
 			project = project :: model.Project,
 			task = task,
@@ -455,7 +508,7 @@ local function rename_agent(cx: WindowCx, pane: number)
 			return
 		end
 		S.state = model.load()
-		local key = ensure_record(pane, cwd)
+		local key = ensure_record(rcx, pane, cwd)
 		local meta = S.state.agents[key]
 		meta.title = text
 		model.save(S.state)
@@ -504,36 +557,41 @@ local function wake(cx: WindowCx, pane: number)
 	end
 	local m = meta :: model.AgentMeta
 	local wt = m.worktree :: string
-	if not tern.fs.exists(wt) then
-		cx:toast("error", "Worktree is gone", tilde(wt))
-		return
-	end
 	local project = model.get(S.state, m.project)
-	if project == nil then
-		cx:toast("error", "Its project was removed", m.title)
-		return
-	end
+	-- Held while its worktree is checked (a remote host answers a turn or more later).
 	waking[key] = true
-	start_agent(cx, { project = project :: model.Project, prompt = m.task or m.title, cwd = wt }, function(new, rcx)
-		waking[key] = nil
-		S.state = model.load()
-		-- Same record, new pane (and a new omp session): its key, pin and unread mark stay.
-		local rec = S.state.agents[key] or m
-		rec.closed, rec.closed_at, rec.interrupted, rec.lost_at, rec.started = nil, nil, nil, nil, os.time()
-		rec.pane, rec.session_file = new, nil
-		S.state.agents[key] = rec
-		model.save(S.state)
-		S.pane_key[new] = key
-		-- Waking is opening it: the woken agent is read.
-		S.ui = model.load_ui()
-		if S.ui.unread[key] then
-			S.ui.unread[key] = nil
-			S.save_ui()
+	exists_on(cx, if project then project.host else nil, wt, function(found, err, ecx)
+		if not found then
+			waking[key] = nil
+			ecx:toast("error", if err then "Worktree not checked" else "Worktree is gone", err or tilde(wt))
+			return
 		end
-		S.interrupted[key] = nil
-		dress_tab(rcx, new, rec.title, project :: model.Project)
-	end, function()
-		waking[key] = nil
+		if project == nil then
+			waking[key] = nil
+			ecx:toast("error", "Its project was removed", m.title)
+			return
+		end
+		start_agent(ecx, { project = project :: model.Project, prompt = m.task or m.title, cwd = wt }, function(new, rcx)
+			waking[key] = nil
+			S.state = model.load()
+			-- Same record, new pane (and a new omp session): its key, pin and unread mark stay.
+			local rec = S.state.agents[key] or m
+			rec.closed, rec.closed_at, rec.interrupted, rec.lost_at, rec.started = nil, nil, nil, nil, os.time()
+			rec.pane, rec.session_file = new, nil
+			S.state.agents[key] = rec
+			model.save(S.state)
+			S.pane_key[new] = key
+			-- Waking is opening it: the woken agent is read.
+			S.ui = model.load_ui()
+			if S.ui.unread[key] then
+				S.ui.unread[key] = nil
+				S.save_ui()
+			end
+			S.interrupted[key] = nil
+			dress_tab(rcx, new, rec.title, project :: model.Project)
+		end, function()
+			waking[key] = nil
+		end)
 	end)
 end
 
@@ -548,8 +606,24 @@ local function copy_name(cx: WindowCx, pane: number)
 	cx:copy(S.title_of(pane, S.cwd_of(pane)))
 end
 
-local function open_in_finder(cx: WindowCx, path: string?)
+-- Shows `path` in the file manager here; on a remote `host` (nothing of it is browsable from this machine) opens
+-- a shell there in it instead.
+local function open_in_finder(cx: WindowCx, path: string?, host: string?)
 	if path == nil then
+		return
+	end
+	if host then
+		local rec = host_record(cx, host)
+		if rec == nil or rec.state ~= "connected" then
+			cx:toast("error", "Terminal not opened", host .. " is not connected")
+			return
+		end
+		local ok, err = pcall(function()
+			cx.hosts:terminal((rec :: ManagedHost).id, { cwd = path })
+		end)
+		if not ok then
+			cx:toast("error", "Terminal not opened", tostring(err))
+		end
 		return
 	end
 	tern.process.run({ if MACOS then "open" else "xdg-open", path }, { timeout_ms = 10000 }, function(res, rcx)
@@ -604,7 +678,7 @@ local function forget(key: string)
 	S.interrupted[key] = nil
 end
 
-local function offer_force_branch(cx: WindowCx, root: string, branch: string)
+local function offer_force_branch(cx: WindowCx, host: string?, root: string, branch: string)
 	ask_pick(cx, {
 		items = {
 			{ label = "Force Delete Branch", detail = branch, icon = "trash", force = true },
@@ -616,11 +690,11 @@ local function offer_force_branch(cx: WindowCx, root: string, branch: string)
 		if not (item :: any).force then
 			return
 		end
-		git({ "-C", root, "branch", "-D", "--", branch }, function(res, gcx)
+		git_on(S, host, { "branch", "-D", "--", branch }, function(res, gcx)
 			if gcx and res.status ~= 0 then
 				gcx:toast("error", "Branch not deleted", errtext(res))
 			end
-		end)
+		end, nil, root)
 	end)
 end
 
@@ -651,6 +725,7 @@ local function run_delete(cx: WindowCx, pane: number)
 	local m = meta :: model.AgentMeta
 	local project = model.get(S.state, m.project)
 	local root = if project then project.root else model.dirname(wt :: string)
+	local host = host_for(cx, pane, project)
 	S.deleting[key] = true
 	S.changed(cx)
 	local function finish(gcx: WindowCx?)
@@ -663,33 +738,41 @@ local function run_delete(cx: WindowCx, pane: number)
 		if branch == nil then
 			return
 		end
-		git({ "-C", root, "branch", "-d", "--", branch }, function(res, bcx)
+		git_on(S, host, { "branch", "-d", "--", branch }, function(res, bcx)
 			if res.status ~= 0 and bcx then
 				bcx:toast("info", "Worktree deleted, branch kept", string.format(
 					'Git could not safely delete branch "%s" after deleting worktree "%s", so it was kept to avoid losing local commits.',
 					branch :: string,
 					model.basename(wt :: string)
 				))
-				offer_force_branch(bcx, root, branch :: string)
+				offer_force_branch(bcx, host, root, branch :: string)
 			end
-		end)
+		end, nil, root)
 	end
-	if not tern.fs.exists(wt :: string) then
-		git({ "-C", root, "worktree", "prune" }, function(_res, gcx)
-			finish(gcx)
-		end)
-		return
-	end
-	git({ "-C", root, "worktree", "remove", "--force", wt :: string }, function(res, gcx)
-		if res.status ~= 0 then
+	exists_on(cx, host, wt :: string, function(found, err, ecx)
+		if err then
 			S.deleting[key] = nil
-			if gcx then
-				gcx:toast("error", "Failed to delete workspace " .. title, errtext(res))
-				S.changed(gcx)
-			end
+			ecx:toast("error", "Failed to delete workspace " .. title, err)
+			S.changed(ecx)
 			return
 		end
-		finish(gcx)
+		if not found then
+			git_on(S, host, { "worktree", "prune" }, function(_res, gcx)
+				finish(gcx)
+			end, nil, root)
+			return
+		end
+		git_on(S, host, { "worktree", "remove", "--force", wt :: string }, function(res, gcx)
+			if res.status ~= 0 then
+				S.deleting[key] = nil
+				if gcx then
+					gcx:toast("error", "Failed to delete workspace " .. title, errtext(res))
+					S.changed(gcx)
+				end
+				return
+			end
+			finish(gcx)
+		end, nil, root)
 	end)
 end
 
@@ -746,26 +829,34 @@ local function delete_agent(cx: WindowCx, pane: number)
 		end)
 	end
 	local wt = if meta then meta.worktree else nil
-	if wt == nil or not tern.fs.exists(wt :: string) then
+	if wt == nil then
 		confirm(cx, 0)
 		return
 	end
-	git({ "-C", wt :: string, "status", "--porcelain" }, function(res, _)
-		local n = 0
-		if res.status == 0 then
-			for _ in string.gmatch(res.stdout, "[^\n]+") do
-				n += 1
-			end
+	local host = host_for(cx, pane, if meta then model.get(S.state, meta.project) or p else p)
+	exists_on(cx, host, wt :: string, function(found, _, ecx)
+		if not found then
+			confirm(ecx, 0)
+			return
 		end
-		defer(function(dcx)
-			confirm(dcx, n)
-		end)
+		git_on(S, host, { "status", "--porcelain" }, function(res, _)
+			local n = 0
+			if res.status == 0 then
+				for _ in string.gmatch(res.stdout, "[^\n]+") do
+					n += 1
+				end
+			end
+			defer(function(dcx)
+				confirm(dcx, n)
+			end)
+		end, nil, wt)
 	end)
 end
 
 -- Installs this module's functions into the context.
 return function(ctx: core.Ctx)
 	S = ctx
+	S.agent_host = agent_host
 	S.color_tab = color_tab
 	S.copy_name = copy_name
 	S.copy_path = copy_path

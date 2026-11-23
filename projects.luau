@@ -12,7 +12,9 @@ local defer = core.defer
 local ensure_session = core.ensure_session
 local errtext = core.errtext
 local focused_cwd = core.focused_cwd
-local git = core.git
+local git_on = core.git_on
+local fs_on = core.fs_on
+local host_now = core.host_now
 local plural = core.plural
 local session_named = core.session_named
 local tilde = core.tilde
@@ -24,17 +26,53 @@ local S: core.Ctx = nil :: any
 -- Projects -------------------------------------------------------------------------
 
 local function open_project(cx: WindowCx, p: model.Project)
-	local created = ensure_session(cx, p)
+	local ok, created = pcall(ensure_session, cx, p)
+	if not ok then
+		cx:toast("error", "Not opened: " .. p.name, tostring(created))
+		return
+	end
 	if created then
 		cx:toast("info", "Opened " .. p.name, tilde(p.root))
 	end
 	S.changed(cx)
 end
 
--- Adds the folder `root` as a project (a repository's top folder gets worktrees) and opens its session.
-local function admit(cx: WindowCx, root: string, as_folder: boolean)
+-- A file check on `host` (core.fs_on) whose callback always gets a window context: the caller's when the answer
+-- came at once (this machine, so local use keeps its single turn), the reply's, else the next turn's.
+local function fs_at(cx: WindowCx, host: string?, fn: string, path: string, cb: (ok: boolean, value: any, err: string?, extra: any, cx: WindowCx) -> ())
+	local sync = true
+	fs_on(S, host, fn, path, function(ok, value, err, extra, rcx)
+		if sync then
+			cb(ok, value, err, extra, cx)
+		elseif rcx then
+			cb(ok, value, err, extra, rcx)
+		else
+			defer(function(dcx)
+				cb(ok, value, err, extra, dcx)
+			end)
+		end
+	end)
+	sync = false
+end
+
+-- `path` with `home` shown as `~` (the host's HOME: a remote one is not this machine's).
+local function tilde_at(path: string, host: string?, home: string?): string
+	if host == nil or home == nil then
+		return tilde(path)
+	end
+	if path == home then
+		return "~"
+	end
+	if string.sub(path, 1, #home + 1) == home .. "/" then
+		return "~" .. string.sub(path, #home + 1)
+	end
+	return path
+end
+
+-- Adds the folder `root` on `host` as a project (a repository's top folder gets worktrees) and opens its session.
+local function admit(cx: WindowCx, root: string, as_folder: boolean, host: string?)
 	S.state = model.load()
-	local ok, p = pcall(model.add_project, S.state, { name = model.basename(root), root = root, worktrees = not as_folder })
+	local ok, p = pcall(model.add_project, S.state, { name = model.basename(root), root = root, worktrees = not as_folder, host = host })
 	if not ok then
 		cx:toast("error", "Project not added", tostring(p))
 		return
@@ -43,46 +81,116 @@ local function admit(cx: WindowCx, root: string, as_folder: boolean)
 	open_project(cx, p :: model.Project)
 end
 
-local function admit_path(cx: WindowCx, root: string)
-	if not tern.fs.exists(root) then
-		cx:toast("error", "No such folder", tilde(root))
+local function admit_path(cx: WindowCx, root: string, host: string?)
+	fs_at(cx, host, "exists", root, function(ok, found, err, _, ecx)
+		if not ok then
+			ecx:toast("error", "Folder not checked", err)
+			return
+		end
+		if not found then
+			ecx:toast("error", "No such folder", tilde(root))
+			return
+		end
+		git_on(S, host, { "rev-parse", "--show-prefix" }, function(res, _)
+			defer(function(gcx)
+				if res.status == 0 then
+					-- Inside a repository: only its top folder can hold worktrees.
+					admit(gcx, root, trimmed(res.stdout) ~= "", host)
+					return
+				end
+				ask_pick(gcx, {
+					items = {
+						{
+							label = "Open as Folder",
+							detail = "This folder isn't a Git repository. You'll have the editor, terminal, and search, but Git-based features won't be available.",
+							icon = "folder-open",
+							open = true,
+						},
+						{ label = "Cancel", icon = "x", open = false },
+					},
+					placeholder = "Open as Folder",
+					icon = "folder",
+				}, function(item, pcx)
+					if (item :: any).open then
+						admit(pcx, root, true, host)
+					end
+				end)
+			end)
+		end, nil, root)
+	end)
+end
+
+-- Asks for a path on `host` (`~` is `home`, that host's HOME), relative ones resolved against `default`.
+local function ask_path(cx: WindowCx, placeholder: string, default: string, fn: (path: string, cx: WindowCx) -> (), host: string?, home: string?)
+	ask_text(cx, { value = tilde_at(default, host, home), placeholder = placeholder, icon = "folder", action = "next" }, function(text, rcx)
+		fn(model.resolve(default, text, if host then home else HOME), rcx)
+	end)
+end
+
+-- Runs `fn` with the HOME of `host` (this machine's at once; a remote one's asked of its host half).
+local function with_home(cx: WindowCx, host: string?, fn: (home: string?, cx: WindowCx) -> ())
+	if host == nil then
+		fn(HOME, cx)
 		return
 	end
-	git({ "-C", root, "rev-parse", "--show-prefix" }, function(res, _)
-		defer(function(gcx)
-			if res.status == 0 then
-				-- Inside a repository: only its top folder can hold worktrees.
-				admit(gcx, root, trimmed(res.stdout) ~= "")
-				return
-			end
-			ask_pick(gcx, {
-				items = {
-					{
-						label = "Open as Folder",
-						detail = "This folder isn't a Git repository. You'll have the editor, terminal, and search, but Git-based features won't be available.",
-						icon = "folder-open",
-						open = true,
-					},
-					{ label = "Cancel", icon = "x", open = false },
-				},
-				placeholder = "Open as Folder",
-				icon = "folder",
-			}, function(item, pcx)
-				if (item :: any).open then
-					admit(pcx, root, true)
+	fs_at(cx, host, "home", "~", function(ok, home, err, _, hcx)
+		if not ok or type(home) ~= "string" then
+			hcx:toast("error", "Can't reach " .. host, err)
+			return
+		end
+		fn(home, hcx)
+	end)
+end
+
+-- Browses the remote `host`'s folders from `path`: up, use this folder, type a path, then its subfolders.
+local function browse_remote(cx: WindowCx, host: string, home: string, path: string)
+	fs_at(cx, host, "dirs", path, function(ok, names, err, extra, dcx)
+		if not ok then
+			dcx:toast("error", "Folder not listed", err)
+			return
+		end
+		local is_git = type(extra) == "table" and extra.git == true
+		local items: { PickItem } = {}
+		if path ~= "/" then
+			table.insert(items, { label = ".. (up)", detail = tilde_at(model.dirname(path), host, home), icon = "arrow-left", go = model.dirname(path) })
+		end
+		table.insert(items, {
+			label = "Use this folder: " .. tilde_at(path, host, home),
+			detail = if is_git then "Git repository" else nil,
+			icon = if is_git then "branch" else "check",
+			use = true,
+		})
+		table.insert(items, { label = "Type a path…", icon = "edit", typed = true })
+		if type(names) == "table" then
+			for _, name in names do
+				if type(name) == "string" then
+					table.insert(items, { label = name, icon = "folder", go = (if path == "/" then "" else path) .. "/" .. name })
 				end
-			end)
+			end
+		end
+		ask_pick(dcx, { items = items, placeholder = (model.host_short(host) or host) .. ": " .. tilde_at(path, host, home), icon = "folder" }, function(item, pcx)
+			local it = item :: any
+			if it.use then
+				admit_path(pcx, path, host)
+			elseif it.typed then
+				ask_path(pcx, "Project folder on " .. host, path, function(typed, tcx)
+					admit_path(tcx, typed, host)
+				end, host, home)
+			elseif type(it.go) == "string" then
+				browse_remote(pcx, host, home, it.go)
+			end
 		end)
 	end)
 end
 
-local function ask_path(cx: WindowCx, placeholder: string, default: string, fn: (path: string, cx: WindowCx) -> ())
-	ask_text(cx, { value = tilde(default), placeholder = placeholder, icon = "folder", action = "next" }, function(text, rcx)
-		fn(model.resolve(default, text, HOME), rcx)
-	end)
-end
-
 local function browse_folder(cx: WindowCx)
+	local host = host_now(cx)
+	if host then
+		with_home(cx, host, function(home, hcx)
+			browse_remote(hcx, host :: string, home :: string, home :: string)
+		end)
+		return
+	end
 	local _, cwd = focused_cwd(cx)
 	if not MACOS then
 		ask_path(cx, "Project folder", cwd or HOME or "/", function(path, pcx)
@@ -112,68 +220,85 @@ local function name_taken(cx: WindowCx, root: string): boolean
 	return false
 end
 
+-- Clones on the current host, into a folder of its HOME by default.
 local function clone_project(cx: WindowCx)
+	local host = host_now(cx)
 	ask_text(cx, { placeholder = "https://github.com/user/repo.git", icon = "globe", action = "next" }, function(url, ucx)
-		ask_path(ucx, "Parent folder", HOME or "/", function(parent, pcx)
-			local name = string.gsub(string.match(url, "([^/:]+)/*$") or "project", "%.git$", "")
-			local dest = parent .. "/" .. name
-			if name_taken(pcx, dest) then
-				return
-			end
-			pcx:toast("info", "Cloning...", url)
-			git({ "clone", "--", url, dest }, function(res, _)
-				defer(function(gcx)
-					if res.timed_out then
-						gcx:toast("error", "Clone timed out", "After 10 minutes; " .. tilde(dest) .. " may hold a partial clone to remove before retrying")
-						return
-					end
-					if res.status ~= 0 then
-						gcx:toast("error", "Clone failed", errtext(res))
-						return
-					end
-					admit_path(gcx, dest)
-				end)
-			end, 600000)
+		with_home(ucx, host, function(home, hcx)
+			ask_path(hcx, "Parent folder", home or "/", function(parent, pcx)
+				local name = string.gsub(string.match(url, "([^/:]+)/*$") or "project", "%.git$", "")
+				local dest = parent .. "/" .. name
+				if name_taken(pcx, dest) then
+					return
+				end
+				pcx:toast("info", "Cloning...", url)
+				git_on(S, host, { "clone", "--", url, dest }, function(res, _)
+					defer(function(gcx)
+						if res.timed_out then
+							gcx:toast("error", "Clone timed out", "After 10 minutes; " .. tilde_at(dest, host, home) .. " may hold a partial clone to remove before retrying")
+							return
+						end
+						if res.status ~= 0 then
+							gcx:toast("error", "Clone failed", errtext(res))
+							return
+						end
+						admit_path(gcx, dest, host)
+					end)
+				end, 600000)
+			end, host, home)
 		end)
 	end)
 end
 
+-- Makes an empty repository on the current host, in its HOME by default.
 local function create_project(cx: WindowCx)
+	local host = host_now(cx)
 	ask_text(cx, { placeholder = "my-project", icon = "plus", action = "next" }, function(name, ncx)
-		ask_path(ncx, "Parent folder", HOME or "/", function(parent, pcx)
-			local dest = parent .. "/" .. model.slug(name)
-			if name_taken(pcx, dest) then
-				return
-			end
-			if tern.fs.exists(dest) then
-				pcx:toast("error", "Folder exists", tilde(dest))
-				return
-			end
-			local ok, err = pcall(tern.fs.mkdir, dest)
-			if not ok then
-				pcx:toast("error", "Project not created", tostring(err))
-				return
-			end
-			git({ "-C", dest, "init", "-q" }, function(res, _)
-				defer(function(gcx)
-					if res.status ~= 0 then
-						gcx:toast("error", "Project not created", errtext(res))
+		with_home(ncx, host, function(home, hcx)
+			ask_path(hcx, "Parent folder", home or "/", function(parent, pcx)
+				local dest = parent .. "/" .. model.slug(name)
+				if name_taken(pcx, dest) then
+					return
+				end
+				fs_at(pcx, host, "exists", dest, function(eok, exists, eerr, _, ecx)
+					if not eok then
+						ecx:toast("error", "Project not created", eerr)
 						return
 					end
-					admit_path(gcx, dest)
+					if exists then
+						ecx:toast("error", "Folder exists", tilde_at(dest, host, home))
+						return
+					end
+					fs_at(ecx, host, "mkdir", dest, function(ok, _, err, _, mcx)
+						if not ok then
+							mcx:toast("error", "Project not created", err)
+							return
+						end
+						git_on(S, host, { "init", "-q" }, function(res, _)
+							defer(function(gcx)
+								if res.status ~= 0 then
+									gcx:toast("error", "Project not created", errtext(res))
+									return
+								end
+								admit_path(gcx, dest, host)
+							end)
+						end, nil, dest)
+					end)
 				end)
-			end)
+			end, host, home)
 		end)
 	end)
 end
 
--- Orca's "Add a project" start: browse, clone or create.
+-- Orca's "Add a project" start: browse, clone or create (on the current host).
 local function add_project(cx: WindowCx)
+	local host = host_now(cx)
+	local where = if host then "on " .. host else "on this host"
 	ask_pick(cx, {
 		items = {
-			{ label = "Browse folder", detail = "Existing Git repository or folder on this host", icon = "folder-open", run = "browse" },
-			{ label = "Clone from URL", detail = "Clone a remote Git repository", icon = "globe", run = "clone" },
-			{ label = "Create new project", detail = "Start from an empty folder", icon = "plus", run = "create" },
+			{ label = "Browse folder", detail = "Existing Git repository or folder " .. where, icon = "folder-open", run = "browse" },
+			{ label = "Clone from URL", detail = "Clone a remote Git repository" .. (if host then " " .. where else ""), icon = "globe", run = "clone" },
+			{ label = "Create new project", detail = "Start from an empty folder" .. (if host then " " .. where else ""), icon = "plus", run = "create" },
 		},
 		placeholder = "Add a project",
 		icon = "folder-plus",
@@ -320,12 +445,13 @@ local function rename_project(cx: WindowCx, id: string)
 		return
 	end
 	local old = (p :: model.Project).name
+	local host = (p :: model.Project).host
 	ask_text(cx, { value = old, placeholder = "Rename project", icon = "folder", action = "rename" }, function(name, rcx)
 		if name == old then
 			return
 		end
-		local session = session_named(rcx, old)
-		if session and session_named(rcx, name) then
+		local session = session_named(rcx, old, host)
+		if session and session_named(rcx, name, host) then
 			rcx:toast("error", "Project not renamed", "a session named " .. name .. " exists")
 			return
 		end
@@ -372,7 +498,11 @@ local function project_settings(cx: WindowCx, id: string)
 	table.insert(items, { label = "Move up", group = "Order", icon = "arrow-left", run = "up" })
 	table.insert(items, { label = "Move down", group = "Order", icon = "arrow-down", run = "down" })
 	table.insert(items, { label = "Copy Path", detail = tilde(project.root), group = "Folder", icon = "copy", run = "copy" })
-	table.insert(items, { label = "Open in Finder", group = "Folder", icon = "folder-open", run = "finder" })
+	if project.host then
+		table.insert(items, { label = "Open terminal on " .. (model.host_short(project.host) or ""), detail = project.root, group = "Folder", icon = "terminal", run = "finder" })
+	else
+		table.insert(items, { label = "Open in Finder", group = "Folder", icon = "folder-open", run = "finder" })
+	end
 	ask_pick(cx, { items = items, placeholder = "Project Settings · " .. project.name, icon = "sliders" }, function(item, pcx)
 		local it = item :: any
 		if apply_color(pcx, project, it, reopen) then
@@ -396,7 +526,7 @@ local function project_settings(cx: WindowCx, id: string)
 		elseif it.run == "copy" then
 			pcx:copy(project.root)
 		elseif it.run == "finder" then
-			S.open_in_finder(pcx, project.root)
+			S.open_in_finder(pcx, project.root, project.host)
 		end
 	end)
 end
@@ -544,7 +674,8 @@ local function project_menu(cx: WindowCx, id: string)
 	if project.group then
 		table.insert(items, { label = "Remove from group", icon = "x", run = "ungroup" })
 	end
-	table.insert(items, { label = "Open session", detail = project.name, icon = "folder-open", run = "open" })
+	local on = model.host_short(project.host)
+	table.insert(items, { label = "Open session", detail = if on then project.name .. " · " .. on else project.name, icon = "folder-open", run = "open" })
 	table.insert(items, { label = "Remove Project", icon = "trash", run = "remove" })
 	ask_pick(cx, { items = items, placeholder = project.name, icon = "folder", action = "run" }, function(item, pcx)
 		local run = (item :: any).run

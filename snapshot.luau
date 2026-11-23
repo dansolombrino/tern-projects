@@ -366,6 +366,7 @@ local function snapshot(cx: WindowCx): any
 			current = current.name == p.name,
 			agents = agents,
 			group = g,
+			host = model.host_short(p.host),
 			gh = S.gh_project(p),
 		})
 		if not S.ui.collapsed[p.id] and not (g and S.ui.collapsed["group:" .. g.id]) then

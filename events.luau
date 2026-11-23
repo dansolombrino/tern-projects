@@ -74,7 +74,8 @@ function H.canvas_action(ev: CanvasAction, cx: WindowCx): boolean?
 		elseif act == "copy_name" then
 			S.copy_name(cx, pane)
 		elseif act == "open_finder" then
-			S.open_in_finder(cx, S.cwd_of(pane))
+			-- A remote agent's folder opens as a shell on its host.
+			S.open_in_finder(cx, S.cwd_of(pane), S.agent_host(cx, pane))
 		elseif act == "toggle_kids" then
 			S.expanded[pane] = if S.expanded[pane] then nil else true
 			S.refresh_side(cx)

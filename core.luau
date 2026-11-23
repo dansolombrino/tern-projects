@@ -343,6 +343,10 @@ end
 local function scan_rest()
 	S.state = model.load()
 	read_status()
+	-- Remote hosts' status (remote.luau): their panes' omp session files, branches and queued mail join this host's.
+	if S.remote_merge then
+		S.remote_merge()
+	end
 	local live: { [number]: { cwd: string } } = {}
 	for pane, b in S.blocks do
 		live[pane] = { cwd = b.cwd }
@@ -444,6 +448,92 @@ local function git(args: { string }, cb: (res: ProcessResult, cx: WindowCx?) -> 
 	end)
 end
 
+-- Host dispatch. `host` is nil for this machine (the window's own), else a remote Tern host's name
+-- (`ManagedHost.name`); remote work goes through that host's bridge block (remote.luau, `S.remote_rpc`).
+
+-- Runs git on `host`: here as `git` above, there through the bridge (same result shape; a transport failure is
+-- status -1 with the reason in stderr). `cwd` is passed as `git -C`.
+local function git_on(ctx: any, host: string?, args: { string }, cb: (res: ProcessResult, cx: WindowCx?) -> (), timeout_ms: number?, cwd: string?)
+	if host == nil then
+		if cwd then
+			local full = { "-C", cwd }
+			for _, a in args do
+				table.insert(full, a)
+			end
+			git(full, cb, timeout_ms)
+		else
+			git(args, cb, timeout_ms)
+		end
+		return
+	end
+	ctx.remote_rpc(host, { op = "git", args = args, cwd = cwd, timeout_ms = timeout_ms or 30000 }, function(reply: any, cx: WindowCx?)
+		if type(reply) == "table" and reply.ok == true then
+			cb({
+				status = if type(reply.status) == "number" then reply.status else -1,
+				stdout = if type(reply.stdout) == "string" then reply.stdout else "",
+				stderr = if type(reply.stderr) == "string" then reply.stderr else "",
+				timed_out = reply.timed_out == true,
+			}, cx)
+		else
+			local why = if type(reply) == "table" then tostring(reply.message or reply.error) else "no reply"
+			cb({ status = -1, stdout = "", stderr = host .. ": " .. why, timed_out = false }, cx)
+		end
+	end, (timeout_ms or 30000) + 15000)
+end
+
+-- A file check on `host`: fn "exists" (value: boolean), "mkdir" (mkdir -p), "dirs" (value: sorted subfolder names;
+-- extra: the reply, `git` = whether the folder is in a git work tree), "home" (value: the host's HOME).
+-- `cb(ok, value, err, extra, cx)`; on this machine it runs before `fs_on` returns.
+local function fs_on(ctx: any, host: string?, fn: string, path: string, cb: (ok: boolean, value: any, err: string?, extra: any, cx: WindowCx?) -> ())
+	if host == nil then
+		local ok, value = pcall(function(): any
+			if fn == "exists" then
+				return tern.fs.exists(path)
+			elseif fn == "mkdir" then
+				tern.fs.mkdir(path)
+				return true
+			elseif fn == "home" then
+				return HOME
+			elseif fn == "dirs" then
+				local out = {}
+				for _, name in tern.fs.list(path) do
+					if string.sub(name, 1, 1) ~= "." and tern.fs.exists(path .. "/" .. name .. "/.") then
+						table.insert(out, name)
+					end
+				end
+				table.sort(out)
+				return out
+			end
+			error("unknown fs op " .. fn)
+		end)
+		cb(ok, if ok then value else nil, if ok then nil else tostring(value), nil, nil)
+		return
+	end
+	ctx.remote_rpc(host, { op = "fs", fn = fn, path = path }, function(reply: any, cx: WindowCx?)
+		if type(reply) == "table" and reply.ok == true then
+			cb(true, reply.value, nil, reply, cx)
+		else
+			local why = if type(reply) == "table" then tostring(reply.message or reply.error) else "no reply"
+			cb(false, nil, host .. ": " .. why, nil, cx)
+		end
+	end, 20000)
+end
+
+-- A window → host request (the host half's spool ops: deliver, ack, gh_*, auto_*): a file in `<data>/spool/` here,
+-- a bridge request there (remote.luau retries it until the host confirms it).
+local spool_seq = 0
+local function spool_on(ctx: any, host: string?, obj: { [string]: any })
+	if host ~= nil then
+		ctx.remote_spool(host, obj)
+		return
+	end
+	spool_seq += 1
+	local dir = tern.plugin.data .. "/spool"
+	local name = string.format("%012d-%06d-%04x.json", os.time(), spool_seq, math.random(0, 0xffff))
+	pcall(tern.fs.mkdir, dir)
+	tern.fs.write(dir .. "/" .. name, tern.json.encode(obj))
+end
+
 local function errtext(res: ProcessResult): string
 	return trimmed(if res.stderr ~= "" then res.stderr else res.stdout)
 end
@@ -462,23 +552,85 @@ local function session_of(cx: WindowCx, pane: number): SessionInfo?
 	return nil
 end
 
-local function session_named(cx: WindowCx, name: string): ManagedSession?
+-- Hosts -----------------------------------------------------------------------------
+-- A host is named by `ManagedHost.name`; nil stands for the window's own machine (the local host).
+
+local function hosts_list(cx: WindowCx): { ManagedHost }
+	local ok, list = pcall(function()
+		return cx.hosts:list()
+	end)
+	return if ok and type(list) == "table" then list else {}
+end
+
+-- The current session's host, nil when it is this machine.
+local function host_now(cx: WindowCx): string?
+	local ok, h = pcall(function()
+		return cx.hosts:current()
+	end)
+	if ok and type(h) == "table" and h.kind == "remote" then
+		return h.name
+	end
+	return nil
+end
+
+-- The host `ManagedHost.id` names, nil when local or unknown.
+local function host_name(cx: WindowCx, id: number): string?
+	for _, h in hosts_list(cx) do
+		if h.id == id then
+			return if h.kind == "remote" then h.name else nil
+		end
+	end
+	return nil
+end
+
+-- The `ManagedHost` record of `host` (nil: the local one), nil when not attached.
+local function host_record(cx: WindowCx, host: string?): ManagedHost?
+	for _, h in hosts_list(cx) do
+		if (host == nil and h.kind == "local") or (host ~= nil and h.kind == "remote" and h.name == host) then
+			return h
+		end
+	end
+	return nil
+end
+
+-- The remote host running `pane` (a window pane id), nil when it runs here.
+local function host_of_pane(cx: WindowCx, pane: number): string?
+	for _, h in hosts_list(cx) do
+		if h.kind == "remote" and table.find(h.panes, pane) then
+			return h.name
+		end
+	end
+	return nil
+end
+
+-- The session named `name` on `host` (nil: this machine). With no hosts listed (an old Tern) any host matches.
+local function session_named(cx: WindowCx, name: string, host: string?): ManagedSession?
+	local rec = host_record(cx, host)
 	for _, s in cx.sessions:list() do
-		if s.name == name then
+		if s.name == name and (rec == nil or s.host == rec.id) then
 			return s
 		end
 	end
 	return nil
 end
 
--- Shows the project's session, creating it at the root when missing; the created session's id, else nil.
+-- Shows the project's session (on the project's host), creating it at the root when missing; the created
+-- session's id, else nil. Raises when the project's host is not connected (nothing would start there).
 local function ensure_session(cx: WindowCx, project: model.Project): number?
-	local s = session_named(cx, project.name)
+	local host = project.host
+	local s = session_named(cx, project.name, host)
 	if s then
 		if not s.current then
 			cx.sessions:switch(s.id)
 		end
 		return nil
+	end
+	if host_now(cx) ~= host then
+		local rec = host_record(cx, host)
+		if rec == nil or rec.state ~= "connected" then
+			error(string.format("%s is not connected (Switch host first)", host or "this machine"), 0)
+		end
+		cx.hosts:switch(rec.id)
 	end
 	return cx.sessions:create({ name = project.name, cwd = project.root }).id
 end
@@ -724,12 +876,20 @@ return {
 	defer = defer,
 	ensure_session = ensure_session,
 	errtext = errtext,
+	fs_on = fs_on,
 	firstline = firstline,
 	focused_cwd = focused_cwd,
 	git = git,
+	git_on = git_on,
+	spool_on = spool_on,
 	key_of = key_of,
 	plural = plural,
 	session_named = session_named,
+	host_now = host_now,
+	host_name = host_name,
+	host_record = host_record,
+	host_of_pane = host_of_pane,
+	hosts_list = hosts_list,
 	session_of = session_of,
 	short = short,
 	tilde = tilde,

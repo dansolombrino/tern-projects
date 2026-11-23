@@ -28,6 +28,8 @@ export type Project = {
 	created: number,
 	-- Id of the project group it sits in.
 	group: string?,
+	-- The remote Tern host the project lives on (`ManagedHost.name`); nil for the window's own machine.
+	host: string?,
 }
 
 -- A named run of projects in the sidebar (Orca's project groups).
@@ -336,6 +338,14 @@ function model.normalize_icon(v: any): ProjectIcon?
 	return nil
 end
 
+-- A host's short label: its name after the `@` (`me@rig-4090` → `rig-4090`); nil for this machine.
+function model.host_short(host: string?): string?
+	if host == nil or host == "" then
+		return nil
+	end
+	return string.match(host, "@([^@]+)$") or host
+end
+
 -- Projects ------------------------------------------------------------------------
 
 -- The project with id `id`.
@@ -348,17 +358,19 @@ function model.get(state: State, id: string): Project?
 	return nil
 end
 
--- The project `path` belongs to: inside its root or one of its worktrees; the longest match wins.
-function model.project_for_path(state: State, path: string?): Project?
+-- The project `path` belongs to: inside its root or one of its worktrees; the longest match wins. With `host`
+-- (the remote host the path is on) that host's projects win over others; nil matches every project alike.
+function model.project_for_path(state: State, path: string?, host: string?): Project?
 	if path == nil or path == "" then
 		return nil
 	end
 	local best: Project? = nil
-	local best_len = -1
+	local best_len, best_same = -1, false
 	for _, p in state.projects do
+		local same = host ~= nil and p.host == host
 		for _, root in { p.root, model.worktrees_dir(p) } do
-			if model.inside(path, root) and #root > best_len then
-				best, best_len = p, #root
+			if model.inside(path, root) and ((same and not best_same) or (same == best_same and #root > best_len)) then
+				best, best_len, best_same = p, #root, same
 			end
 		end
 	end
@@ -397,6 +409,7 @@ function model.normalize(raw: any): State
 					worktrees = p.worktrees == true,
 					created = if type(p.created) == "number" then p.created else 0,
 					group = if type(p.group) == "string" and group_ids[p.group] then p.group else nil,
+					host = if type(p.host) == "string" and p.host ~= "" then p.host else nil,
 				})
 			end
 		end
@@ -493,6 +506,8 @@ export type NewProject = {
 	root: string,
 	color: string?,
 	worktrees: boolean?,
+	-- Remote host (`ManagedHost.name`); nil for this machine.
+	host: string?,
 }
 
 -- Why `name` (trimmed) can't name a new project or project `except`: empty or taken; nil when it can.
@@ -523,7 +538,7 @@ function model.rename_project(state: State, id: string, name: string): boolean
 	return true
 end
 
--- Adds a project; errors when its name or root is taken. Returns it.
+-- Adds a project; errors when its name or root (on the same host) is taken. Returns it.
 function model.add_project(state: State, spec: NewProject): Project
 	local name = strip(spec.name)
 	local why = model.name_conflict(state, name)
@@ -534,8 +549,9 @@ function model.add_project(state: State, spec: NewProject): Project
 	if string.sub(root, 1, 1) ~= "/" then
 		error("project root must be an absolute path: " .. root, 0)
 	end
+	local host = if spec.host ~= "" then spec.host else nil
 	for _, p in state.projects do
-		if p.root == root then
+		if p.root == root and p.host == host then
 			error(p.name .. " already has root " .. root, 0)
 		end
 	end
@@ -553,6 +569,7 @@ function model.add_project(state: State, spec: NewProject): Project
 		color = model.normalize_color(spec.color),
 		worktrees = spec.worktrees ~= false,
 		created = now(),
+		host = host,
 	}
 	table.insert(state.projects, project)
 	return project
