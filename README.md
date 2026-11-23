@@ -20,11 +20,61 @@ agents per project** (each a workspace card), and **subagents per agent**.
 
 ```sh
 tern plugin link ~/src/tern-projects    # use it where it is; saving a file reloads it
-tern plugin list                        # projects … host, window  ready
+tern plugin list                        # projects … 1 blocks … host, window  ready
 ```
 
 `tern plugin unlink projects` removes it. For type-checking, `tern plugin types ~/src/tern-projects`
 writes `tern.d.luau` (git-ignored) for luau-lsp.
+
+### On a remote Tern host
+
+Each Tern host's daemon runs the host half of the plugins installed *on that host*; the window half always runs
+on the window's machine. So for projects on a remote host (one served by `tern remote serve` and shown with
+Switch host, ⌃⌘H), install the plugin on both: the window's machine as above, and the remote host:
+
+```sh
+ssh rig-4090
+git clone https://github.com/dansolombrino/tern-projects.git ~/src/tern-projects   # or any checkout
+tern plugin link ~/src/tern-projects    # the host's own daemon loads it; no restart, its sessions keep running
+tern plugin list                        # projects 0.7.0 … 1 blocks, 0 lenses, window  ready
+ls ~/.local/state/tern/plugin-data/projects/   # status.json, mailbox.sock, … (Linux data dir)
+```
+
+Needs `git` and `python3` there (and `gh`, logged in, for PRs and issues; `omp` for automations). Without the
+plugin there, that host's projects still list but nothing reaches the host (the window logs it once and retries
+every 5 min). See *Remote hosts*.
+
+## Remote hosts
+
+A project lives on one Tern host: the one that was current when it was added (Add project offers that host's
+folders). Its header shows the host (`rig-4090`), and everything about it runs there:
+
+- its session is created and found on that host (a click switches the window to it; a disconnected host is a
+  toast, nothing starts elsewhere);
+- git (worktrees, branches, Delete's status, worktree remove, branch delete), folder checks, clone and create
+  run on that host; Add project's **Browse folder** is a picker over that host's folders (`.. (up)`, *Use this
+  folder*, *Type a path…*, the subfolders), starting at its home;
+- its branch reads, GitHub polling (`gh` on that host), fleets (that host's `agent-fleet` state), mailbox and
+  automations are that host's host half's; the sidebar shows them beside this machine's, remote ones tagged
+  with the host (`remote-check · rig-4090`);
+- *Open in Finder* becomes *Open terminal on rig-4090* (a shell there, in the folder).
+
+**How** (`bridge.luau`, `host.luau`; `remote.luau`, `remotepure.luau`). Tern gives a plugin no channel between a
+window and another machine's host half, but a plugin block runs in the host half of the host it opens on, and
+the window reads its view and sends it events. So the host half defines block `projects.bridge`; a window opens
+one on a remote host (once, while that host is current) and parks it (it sits in *no tab* of a session there,
+out of sight). Its view is the host's state as JSON text: a header (signatures and chunk counts), then status,
+fleets, GitHub, automations, queued mail and request replies, each cut into ≤ 30000-byte text nodes (a window
+reads at most 64000 characters per read). The window polls the header every 2 s and re-reads only the parts
+whose signature moved, one chunk per callback. Requests (`git`, `fs`, `spool`, `sync`, `hello`) go to the
+block as events and answers come back in its replies part. `sync` tells the host which projects of the window's
+list live there (kept in its kv `projects.hostsync.v1`), so its GitHub polling, branch reads and automations
+see them. Pane ids differ between a host and the window (a host id `hi·2³² + lo` shows as `base + hi·2²⁴ + lo`):
+the window derives `base` from the bridge and checks it against the host's panes before using it.
+
+The first window to say `hello` to a host delivers that host's mail and starts its pane automations (only while
+that host is current; otherwise the run goes headless after 20 s). Automations, fleets and the mailbox of a
+remote host run in its daemon with no window: a schedule fires and a headless run finishes with the Mac asleep.
 
 ## Sidebar
 
@@ -257,7 +307,7 @@ What maps to Orca, and what doesn't:
 | run history (100 per automation), statuses | 50 per automation; Done, Failed, Timed out, Missed, Skipped (busy, precheck), Canceled, Lost |
 | one dispatch lane per automation | one active run per automation (`Skipped (busy)`) |
 | bot automations, event triggers (`--on slack.mentioned`, `github.ci_failed`, …), `--once` waits, results to Slack/Linear | not supported: no connectors in Tern |
-| remote hosts (`--host`, SSH, paired servers) | this machine only |
+| remote hosts (`--host`, SSH, paired servers) | the project's Tern host (install the plugin there, see *Remote hosts*) |
 | usage (tokens) per run | not shown (the pane shows omp's own; headless output has the answer only) |
 | (Orca needs its window open: #7270) | the host half schedules with no window; a pane run goes headless when no window is open |
 
@@ -385,17 +435,21 @@ Scripts (the agent-fleet skill) send messages to agents through the plugin: dura
 `cx.agents:ask` (one atomic omp send) only while the agent is idle or waiting for input, never
 mid-turn (tern-sdk#320).
 
-**Where.** When its helper is up, the plugin writes `mailbox.json` into its data dir,
-`<config>/plugin-data/projects/`, where `<config>` is `$TERN_CONFIG_DIR`, else on macOS
-`~/Library/Application Support/Tern` (Linux: `~/.config/tern`, unverified):
+**Where.** When its helper is up, the plugin writes `mailbox.json` into its data dir (`tern.plugin.data`):
+on macOS `<config>/plugin-data/projects/`, `<config>` being `$TERN_CONFIG_DIR`, else
+`~/Library/Application Support/Tern`. On Linux Tern's data dir is `~/.local/state/tern/plugin-data/projects/`,
+while scripts look in `<config>/plugin-data/projects/` with `<config>` = `$TERN_CONFIG_DIR`, else
+`${XDG_CONFIG_HOME:-~/.config}/tern`; where the two differ the helper writes the same file in both places.
 
 ```json
 {"version": 1, "socket": "/Users/me/Library/Application Support/Tern/plugin-data/projects/mailbox.sock", "pid": 4242, "started_at": "2026-11-19T16:20:00+00:00"}
 ```
 
-The socket is `mailbox.sock` in that dir, or `$TMPDIR/tern-projects-<uid>/mailbox.sock` when that
-path is over 100 bytes (Unix socket paths are short). The file is replaced when the helper restarts
-and removed when it stops (a killed helper leaves it: check that `pid` lives).
+The socket is `mailbox.sock` in the data dir, or `$TMPDIR/tern-projects-<uid>/mailbox.sock` when that
+path is over 100 bytes (Unix socket paths are short). On a filesystem that keeps no file modes (a FUSE or NTFS
+mount) it moves to a private folder, `$XDG_RUNTIME_DIR/tern-projects/`, else `/tmp/tern-projects-<uid>/`.
+The files are replaced when the helper restarts and removed when it stops (a killed helper leaves them: check
+that `pid` lives).
 
 **Protocol v1.** A Unix stream socket (mode 0600); one JSON object per line, one request per
 connection, the reply, then close.
@@ -436,8 +490,10 @@ message twice. Subagent report-backs go into the same queue the same way.
 **Limits.**
 
 - Delivery needs an open Tern window (`cx.agents` exists only in a window). With none, messages wait
-  queued, and `deliver` still answers.
-- Only omp agents Tern knows as agents (`cx.agents`), in this Tern, are targets.
+  queued, and `deliver` still answers. On a remote host (see *Remote hosts*) that means a window attached to
+  it: checked 2026-11-23, a message `tern_fleet.py` queued on rig-4090 while no window was attached stayed
+  `queued` and went out as soon as the Mac window was attached to it again.
+- Only omp agents Tern knows as agents (`cx.agents`), in a window attached to the queue's host, are targets.
 - Delivery is into the agent's chat as a prompt; nothing shows a message before then.
 
 ## Adding projects, agents and worktrees
@@ -458,7 +514,7 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
 
 ```
 {
-  projects = { { id, name, root, color, icon?, worktrees, created, group? } },
+  projects = { { id, name, root, color, icon?, worktrees, created, group?, host? } },
   groups = { { id, name, created } },
   agents = { ["<key>"] = { project, title, task, worktree?, branch?, parent?, report_back?, started, closed?, closed_at?, pane?, session_file?, cwd?, lost_at? } }
 }
@@ -506,7 +562,9 @@ the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, ref
 (schedules and their occurrences; pure), `automate.luau` (automation definitions, the scheduler tick, history; pure),
 `autohost.luau` (automations in the host half: the clock, runs, files), `autowin.luau` (automations in a window: the
 section, pane runs, actions),
-`sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
+`bridge.luau` (the bridge block's requests, replies and chunked view; pure), `remote.luau` (the window's bridge
+client: polling, requests, merging a remote host's state), `remotepure.luau` (its pure parts: pane-id mapping,
+chunk assembly, merging), `sidebar.luau` (snapshot → canvas nodes), `sidebar.css` (the sidebar), `chrome.css` (its pane chrome
 and the title-bar toggle), `tests/` (pure tests: `luau tests/<file>.luau`; `python3 tests/test_mailbox.py`;
 `python3 tests/test_window_load.py`).
 
@@ -542,8 +600,11 @@ And the port's own:
 - An agent's finished, failed or interrupted state is kept in memory: a plugin reload forgets it.
 - omp-internal subagents are read from at most 600 surface nodes per agent; a longer transcript
   can hide older ones. They are read only while the sidebar shows.
-- Paths are local: projects on remote hosts aren't supported (git and file checks run on this
-  machine).
+- A remote host's sidebar data arrives through its bridge pane every 2 s, so it lags a local host's by up to that.
+  A pane just started there is matched to its card on the next hosts list (up to 2 s).
+- A remote host's delivery ack is held in the window's memory until that host confirms it (a local one is a file):
+  a window reloaded in between can deliver that one message again.
+- Edit automations.json, open a run's output and Open terminal need that remote host to be the current one.
 - The sidebar is a pane of the tab's split tree: it docks left of the tab's leftmost (top-left)
   pane, so in a tab split top/bottom it is as tall as that pane, not the window.
 - The title-bar button and `⌃⌘E` toggle the sidebar instead of Files while the plugin is installed.
