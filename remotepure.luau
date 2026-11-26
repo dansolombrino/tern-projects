@@ -6,9 +6,11 @@
 
 local M = {}
 
+-- The bridge view's layout this window reads (bridge.VERSION on the host); a header with another `v` is not read.
+M.VERSION = 2
 -- The bridge view's nodes after the header (`main.0`), in their fixed order: `main.<n>`.
-M.NODES = { "status", "fleet", "gh", "autos", "mail", "replies" }
-M.INDEX = { status = 1, fleet = 2, gh = 3, autos = 4, mail = 5, replies = 6 } :: { [string]: number }
+M.NODES = { "status", "gh", "autos", "mail", "replies" }
+M.INDEX = { status = 1, gh = 2, autos = 3, mail = 4, replies = 5 } :: { [string]: number }
 
 local P32 = 4294967296
 local P24 = 16777216

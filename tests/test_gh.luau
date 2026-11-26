@@ -393,37 +393,4 @@ test("stale project data is marked, with the error in the tooltip", function()
 	check(string.find(texts(t.find(view, ROOT_ID, LIST .. ".g_app.prs")), "Nothing yet", 1, true) ~= nil, "empty list says so")
 end)
 
-test("fleet worker and group badges", function()
-	sidebar.ui = nil
-	local view = sidebar.build({
-		now = NOW,
-		projects = {},
-		fleets = {
-			{
-				key = "r/f",
-				name = "f",
-				coordinator = { title = "L0 f", state = "idle" },
-				groups = {
-					{
-						key = "r/f/g",
-						name = "g",
-						label = "G g · f",
-						branch = "fleet/g",
-						pr = pr(30, { branch = "fleet/g", state = "OPEN", draft = true }),
-						items = {
-							{ name = "w1", title = "L1 g/w1", branch = "g-w1", pane = 5, state = "working", pr = pr(31, { branch = "g-w1", checks = { run("", "IN_PROGRESS") } }) },
-						},
-					},
-				},
-			},
-		},
-	}).view
-	local fid = LIST .. ".f_r_2ff"
-	local w = t.find(view, ROOT_ID, fid .. ".fg_g.w_w1.row.stack.meta.pr")
-	check(w ~= nil, "worker badge")
-	eq(t.find(view, ROOT_ID, fid .. ".fg_g.w_w1.row.stack.meta.pr.ci").p.class, "op-ci op-ci-pending", "CI running")
-	local g = t.find(view, ROOT_ID, fid .. ".fg_g.head.pr")
-	check(g ~= nil and string.find(g.p.class, "op-pr-draft", 1, true) ~= nil, "group badge, draft")
-end)
-
 t.finish("gh")

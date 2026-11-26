@@ -253,8 +253,6 @@ local STAGES: { { label: string, run: (cx: WindowCx) -> () } } = {
 	{ label = "load remote", run = function() require("./remote") end },
 	{ label = "load mailq", run = function() require("./mailq") end },
 	{ label = "load mail", run = function() require("./mail") end },
-	{ label = "load fleet", run = function() require("./fleet") end },
-	{ label = "load fleets", run = function() require("./fleets") end },
 	{ label = "load prs", run = function() require("./prs") end },
 	{ label = "load sched", run = function() require("./sched") end },
 	{ label = "load autowin", run = function() require("./autowin") end },
@@ -276,7 +274,6 @@ table.insert(STAGES, {
 		require("./pickers")(S)
 		require("./remote")(S)
 		require("./mail")(S)
-		require("./fleets")(S)
 		require("./prs")(S)
 		require("./autowin")(S)
 		S.COMMANDS = COMMANDS

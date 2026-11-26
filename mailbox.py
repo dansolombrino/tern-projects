@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fleet mailbox socket helper for the Tern plugin `projects` (protocol v1; README "Fleet mailbox").
+"""Mailbox socket helper for the Tern plugin `projects` (protocol v1; README "Mailbox").
 
 Two modes, standard library only:
 

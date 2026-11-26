@@ -461,7 +461,7 @@ local function answer_of(cx: WindowCx, pane: number): string?
 	return nil
 end
 
--- Queues the spawned subagent's answer for its parent once its turn ended, in the durable fleet mailbox
+-- Queues the spawned subagent's answer for its parent once its turn ended, in the durable mailbox
 -- (mail.luau), which delivers it when the parent is idle. The answer can trail the event, so a turn without one
 -- is looked at again a few times. One answer is one message: its id is the child's record and the answer's hash.
 local function report_back(cx: WindowCx, pane: number, result: string, tries: number)

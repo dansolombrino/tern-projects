@@ -46,9 +46,7 @@ function H.canvas_action(ev: CanvasAction, cx: WindowCx): boolean?
 	local value = if type(parsed) == "string" then parsed else nil
 	local alt = ev.mods ~= nil and table.find(ev.mods, "alt") ~= nil
 	if pane then
-		if act == "fleet_focus" then
-			S.fleet_focus(cx, pane)
-		elseif act == "focus" then
+		if act == "focus" then
 			if pane < 0 then
 				S.wake(cx, pane)
 			else
@@ -87,9 +85,7 @@ function H.canvas_action(ev: CanvasAction, cx: WindowCx): boolean?
 		end
 		return true
 	end
-	if act == "fleet_group" and value then
-		S.fleet_group(cx, value)
-	elseif act == "open_url" and value then
+	if act == "open_url" and value then
 		S.open_url(cx, value)
 	elseif act == "gh_refresh" and value then
 		S.gh_refresh(cx, value)
@@ -238,7 +234,6 @@ function H.focus(ev: FocusEvent, cx: WindowCx)
 		return
 	end
 	S.last_main = ev.pane
-	S.fleet_focused(ev.pane)
 	S.clear_unread(if S.card_pane(ev.pane) == ev.pane then S.unread_keys(ev.pane) else { core.key_of(ev.pane) })
 	-- (Parked while shown: it waited for a tab with a pane to work in.)
 	if side and S.ui.visible and (S.parked(cx, side) or cx.session:tab_of(side) ~= ev.tab) then

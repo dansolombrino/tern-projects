@@ -2,7 +2,7 @@
 -- projects, host half: runs in Tern's daemon (one VM, 2 s budget, timers that never stall, alive with no window
 -- open). It owns what must not run on a window's UI thread or must outlive a window:
 --
--- - The fleet mailbox (README "Fleet mailbox"): the durable queue in kv key `mailbox.v1` (this half is its only
+-- - The mailbox (README "Mailbox"): the durable queue in kv key `mailbox.v1` (this half is its only
 --   writer) and the socket helper `mailbox.py serve`, a `tern.process.spawn` child that serves protocol v1 on a
 --   Unix socket and relays each request here as a stdout line. Window halves deliver, then report each delivery
 --   (and queue subagent report-backs) through files in `<data>/spool/`, which this half applies.
@@ -12,13 +12,12 @@
 --   read with `gh` on a rate-limited clock and written to `<data>/gh.json`.
 -- - Automations (autohost.luau): the scheduler of Orca-style automations, its headless runs and history.
 -- - The bridge block (`projects.bridge`, bridge.luau): how a window on another machine reaches this half. Its view
---   carries this host's status, fleets, GitHub data, automations, queued mail and request replies; its events are
+--   carries this host's status, GitHub data, automations, queued mail and request replies; its events are
 --   requests (spool reports, git, folder reads, the window's projects on this host).
 
 local mailq = require("./mailq")
 local model = require("./model")
 local identity = require("./identity")
-local fleet = require("./fleet")
 local ghpoll = require("./ghpoll")
 local autohost = require("./autohost")
 local bridge = require("./bridge")
@@ -26,14 +25,11 @@ local bridge = require("./bridge")
 local DATA = tern.plugin.data
 local SPOOL = DATA .. "/spool"
 local STATUS = DATA .. "/status.json"
-local FLEET = DATA .. "/fleet.json"
--- The agent-fleet state root (fleet.luau), fixed for the daemon's environment.
-local FLEET_ROOT = fleet.state_root(tern.getenv)
 local HELPER = tern.plugin.dir .. "/mailbox.py"
 local HOME = tern.getenv("HOME")
 -- The CLI for `tern inspect` (bridge.tern_cli: the daemon's own executable, the app's, the Linux install's, PATH's).
 local TERN_CLI = bridge.tern_cli(tern.getenv, tern.fs.exists)
--- Where agent-fleet scripts look for mailbox.json when that is not `<data>/mailbox.json` (Linux: the daemon's data
+-- Where scripts look for mailbox.json when that is not `<data>/mailbox.json` (Linux: the daemon's data
 -- dir is under ~/.local/state, the scripts look under the config dir); the helper publishes it there too.
 local DISCOVERY = bridge.discovery_path(tern.getenv, tern.runtime.os, tern.plugin.id, DATA)
 
@@ -68,8 +64,6 @@ end
 -- Live panes: id → cwd and omp session file (when it runs omp), from the last poll.
 type PaneSeen = { cwd: string, session_file: string?, agent: boolean }
 local panes: { [number]: PaneSeen } = {}
--- Every pane (exited ones too) and session from the last poll, for the fleets (fleet.luau).
-local live: fleet.Live? = nil
 
 local function agents_now(): ({ mailq.Agent }, { [number]: string })
 	local agents: { mailq.Agent } = {}
@@ -342,84 +336,9 @@ local function poll_panes()
 		end
 		panes = fresh
 		polled = true
-		live = fleet.live_of(doc)
 	end)
 	if not ok then
 		inspecting = false
-	end
-end
-
--- Fleets: the agent-fleet states (tern_fleet.py writes them; this only reads) with live panes and the mailbox, written
--- to `<data>/fleet.json` when the model changed; `fleet_sig` in status.json counts the changes, so a window re-reads
--- the file only then.
-local fleet_cache: fleet.Cache = {}
-local fleet_json: string? = nil
--- Unique per host run, so a window never mistakes a restarted count for the one it read.
-local FLEET_RUN = string.format("%d-%d", os.time(), math.random(1, 1000000))
-local fleet_sig = FLEET_RUN .. ".0"
-local fleet_n = 0
--- How long the last fleet scan took and the longest one this run (ms), reported in status.json.
-local fleet_ms = 0
-local fleet_ms_max = 0
--- The last fleet model: its worktrees and branches get PR badges (ghpoll.luau).
-local fleet_model: fleet.Model? = nil
-
-local function mail_live(): { by_id: { [string]: string }, queued: { [number]: number } }
-	local by_id: { [string]: string } = {}
-	local queued: { [number]: number } = {}
-	local by_file: { [string]: number } = {}
-	for pane, p in panes do
-		if p.session_file then
-			by_file[p.session_file :: string] = pane
-		end
-	end
-	for _, m in box.msgs do
-		by_id[m.id] = m.state
-		if m.state == "queued" then
-			local pane = m.target.pane
-			if (pane == nil or panes[pane] == nil) and m.target.session_file then
-				pane = by_file[m.target.session_file :: string] or pane
-			end
-			if pane then
-				queued[pane] = (queued[pane] or 0) + 1
-			end
-		end
-	end
-	return { by_id = by_id, queued = queued }
-end
-
-local function scan_fleets()
-	if FLEET_ROOT == nil or live == nil then
-		return
-	end
-	local t0 = tern.now()
-	local entries, cache = fleet.read_states(FLEET_ROOT :: string, {
-		list = tern.fs.list,
-		read = function(path: string): string?
-			return tern.fs.read(path, 4194304)
-		end,
-		decode = tern.json.decode,
-	}, fleet_cache)
-	fleet_cache = cache
-	local l = live :: fleet.Live
-	l.mail = mail_live()
-	local m = fleet.build(entries, l)
-	fleet_model = m
-	fleet_ms = tern.now() - t0
-	fleet_ms_max = math.max(fleet_ms_max, fleet_ms)
-	if fleet_ms > 200 then
-		tern.log.warn(string.format("projects: host fleet scan took %.1f ms", fleet_ms))
-	end
-	local text = tern.json.encode(m)
-	if text ~= fleet_json then
-		local ok, err = pcall(tern.fs.write, FLEET, text)
-		if ok then
-			fleet_json = text
-			fleet_n += 1
-			fleet_sig = FLEET_RUN .. "." .. fleet_n
-		else
-			tern.log.warn("projects: fleet.json not written", err)
-		end
 	end
 end
 
@@ -494,9 +413,6 @@ local function write_status()
 		panes = out_panes,
 		repos = out_repos,
 		queued = queued,
-		fleet_sig = fleet_sig,
-		fleet_ms = math.floor(fleet_ms * 10 + 0.5) / 10,
-		fleet_ms_max = math.floor(fleet_ms_max * 10 + 0.5) / 10,
 	}
 	for k, v in ghpoll.stats() do
 		doc[k] = v
@@ -535,7 +451,6 @@ end
 local function update_nodes()
 	local now = os.time()
 	local changed = bridge.track(sigs, "status", status_text)
-	changed = bridge.track(sigs, "fleet", fleet_json or "{}") or changed
 	-- gh.json and autos.json are re-read only when their writer's sig moved.
 	local gs = ghpoll.stats().gh_sig
 	if gs ~= gh_seen then
@@ -761,7 +676,7 @@ tern.block.define("bridge", {
 			null = tern.json.null,
 		})
 		local nodes = { tern.ui.text(tern.json.encode(header)) }
-		-- main.1 .. main.6: a col each, of text children of at most bridge.CHUNK bytes (main.K.I).
+		-- main.1 .. main.5: a col each, of text children of at most bridge.CHUNK bytes (main.K.I).
 		for i = 2, #bridge.NODES do
 			local parts: { Node } = {}
 			for _, piece in sigs.chunks[bridge.NODES[i]] or { "{}" } do
@@ -818,10 +733,6 @@ every(SPOOL_MS, "spool", function()
 end)
 every(PANES_MS, "status", function()
 	poll_panes()
-	local ok, err = pcall(scan_fleets)
-	if not ok then
-		tern.log.warn("projects: host fleet scan failed", err)
-	end
 	write_status()
 	bridge_soon()
 end)
@@ -835,21 +746,6 @@ ghpoll.start({
 		end
 		for cwd, r in repos do
 			table.insert(out, { dir = cwd, branch = r.branch })
-		end
-		local m = fleet_model
-		if m then
-			for _, f in m.fleets do
-				for _, g in f.groups do
-					if g.worktree then
-						table.insert(out, { dir = g.worktree :: string, branch = g.branch })
-					end
-					for _, it in g.items do
-						if it.worktree then
-							table.insert(out, { dir = it.worktree :: string, branch = it.branch })
-						end
-					end
-				end
-			end
 		end
 		return out
 	end,

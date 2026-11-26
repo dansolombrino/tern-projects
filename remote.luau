@@ -2,7 +2,7 @@
 -- projects, remote: the window's side of the bridge to remote Tern hosts (the contract in README "Remote hosts").
 -- A window half runs on the window's machine only, so a host half on a remote host is reached through a block it
 -- defines (`projects.bridge`): this window opens one, parked, on each remote host it is attached to, reads the
--- host's models from the block's view (a JSON header, then status, fleet, gh, autos, mail and replies as JSON in
+-- host's models from the block's view (a JSON header, then status, gh, autos, mail and replies as JSON in
 -- chunks of at most 30000 bytes) and sends requests as TSP action events (`rpc`). Per remote host it
 --
 -- - finds (or, while that host is current, opens) the bridge, one per host;
@@ -46,7 +46,6 @@ type Remote = {
 	base: number?,
 	header: any,
 	status: any,
-	fleet: any,
 	gh: any,
 	autos: any,
 	mail: any,
@@ -99,7 +98,6 @@ local function new_remote(): Remote
 		base = nil,
 		header = nil,
 		status = nil,
-		fleet = nil,
 		gh = nil,
 		autos = nil,
 		mail = nil,
@@ -420,7 +418,7 @@ local function spooling(host: string): number
 	return n
 end
 
--- Re-checks the base against the host's panes and its status; a change re-maps the fleets.
+-- Re-checks the base against the host's panes and its status.
 local function verify(host: string, R: Remote)
 	local h = if type(R.header) == "table" then R.header.pane else nil
 	local old = R.base
@@ -438,9 +436,6 @@ local function verify(host: string, R: Remote)
 	if R.base ~= old then
 		table.clear(R.rmap)
 		S.dirty = true
-		if S.fleets_remote then
-			S.fleets_remote()
-		end
 	end
 end
 
@@ -449,10 +444,6 @@ local function on_node(cx: WindowCx, host: string, R: Remote, name: string)
 	if name == "status" then
 		verify(host, R)
 		S.dirty = true
-	elseif name == "fleet" then
-		if S.fleets_remote then
-			S.fleets_remote()
-		end
 	elseif name == "gh" then
 		if S.gh_remote then
 			S.gh_remote(cx, host)
@@ -504,6 +495,11 @@ local function read_header(cx: WindowCx, host: string)
 	end
 	local h = fetch_header(cx, R)
 	if h == nil then
+		return
+	end
+	if h.v ~= rp.VERSION then
+		-- Another layout (the host's plugin is older or newer than this window's): its nodes would be misread.
+		log_once(R, "version", string.format("projects: %s's bridge is v%s, this window reads v%d (update the projects plugin on both)", host, tostring(h.v), rp.VERSION))
 		return
 	end
 	R.header = h
@@ -658,9 +654,6 @@ local function tick(cx: WindowCx)
 		if not seen[name] then
 			remotes()[name] = nil
 			S.dirty = true
-			if S.fleets_remote then
-				S.fleets_remote()
-			end
 			poll_replies(cx, name)
 		end
 	end

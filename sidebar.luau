@@ -127,47 +127,8 @@ export type Snapshot = {
 	keys: { search: { string }?, new_agent: { string }?, collapse_all: { string }? }?,
 	-- Agents waiting for input, all projects (else counted here).
 	waiting: number?,
-	-- Agent fleets (fleet.luau's model with each card's state), drawn above the projects.
-	fleets: { FleetSnap }?,
 	-- Automations (autowin.luau): drawn after the projects.
 	autos: AutoSnap?,
-}
-
--- A fleet worker or coordinator card's state: working | waiting (its agent needs the user) | ask (it asked the
--- coordinator) | done | failed | idle | starting | gone.
-export type FleetItemSnap = {
-	name: string,
-	title: string,
-	branch: string?,
-	pane: number?,
-	state: string,
-	report: { kind: string, at: number?, text: string? }?,
-	-- Mailbox state of its last message (queued, delivered, failed) and messages queued for it.
-	mailbox: string?,
-	queued: number?,
-	pr: gh.Pr?,
-	pr_stale: boolean?,
-	unread: boolean?,
-}
-
-export type FleetGroupSnap = {
-	key: string,
-	name: string,
-	label: string,
-	branch: string?,
-	session_live: boolean?,
-	creating: boolean?,
-	pr: gh.Pr?,
-	pr_stale: boolean?,
-	items: { FleetItemSnap },
-}
-
-export type FleetSnap = {
-	key: string,
-	name: string,
-	legacy: boolean?,
-	coordinator: { pane: number?, title: string, state: string, session: string?, queued: number? },
-	groups: { FleetGroupSnap },
 }
 
 -- One automation: its schedule, next run, active run (queued, precheck, starting, running) and latest finished run.
@@ -240,10 +201,6 @@ sidebar.ACT = {
 	group_menu = "group_menu",
 	rename_group = "rename_group",
 	delete_group = "delete_group",
-	-- value: a fleet group's key (fleet.luau): show its session (open it when gone)
-	fleet_group = "fleet_group",
-	-- value: a fleet card's pane
-	fleet_focus = "fleet_focus",
 	-- value: a https://github.com/ URL (opened in the system browser)
 	open_url = "open_url",
 	-- value: `owner/repo`: refresh its PRs and issues now
@@ -283,7 +240,6 @@ local PANE_ACTS: { [string]: boolean } = {
 	open_finder = true,
 	toggle_kids = true,
 	toggle_idle = true,
-	fleet_focus = true,
 }
 
 -- For cx.canvas:open's `about`.
@@ -1241,214 +1197,6 @@ local function card_section(snap: Snapshot, key: string, icon_name: string, name
 	return el("div", { key = key, class = "op-group" .. (if shut then " collapsed" else "") }, children)
 end
 
--- Fleets -----------------------------------------------------------------------
-
--- A fleet card's state → its lane glyph and the badge's label.
-local FLEET_GLYPH: { [string]: string } = {
-	working = "working",
-	starting = "working",
-	waiting = "waiting",
-	ask = "waiting",
-	done = "done",
-	failed = "failed",
-	idle = "active",
-	gone = "inactive",
-}
-local FLEET_LABEL: { [string]: string } = {
-	working = "Working",
-	starting = "Starting",
-	waiting = "Needs you",
-	ask = "Asks",
-	done = "Done",
-	failed = "Failed",
-	idle = "Idle",
-	gone = "Gone",
-}
-sidebar.FLEET_LABEL = FLEET_LABEL
-
-local function fleet_badge(state: string): any
-	return span("op-fb op-fb-" .. state, FLEET_LABEL[state] or state, "badge")
-end
-
--- One fleet card (a worker, or the fleet's coordinator): lane glyph and unread dot, title, a meta row (badge, branch or
--- session, mailbox), and its last report with its age.
-local function fleet_card(snap: Snapshot, key: string, o: {
-	title: string,
-	state: string,
-	meta: string?,
-	queued: number?,
-	mailbox: string?,
-	report: { kind: string, at: number?, text: string? }?,
-	unread: boolean?,
-	pane: number?,
-	click: string,
-	extra: string,
-	menu: { any },
-	pr: gh.Pr?,
-	pr_stale: boolean?,
-}): any
-	local cls = "op-card op-fcard " .. o.extra
-	if o.pane ~= nil and snap.active == o.pane then
-		cls ..= " on"
-	end
-	if o.unread then
-		cls ..= " unread"
-	end
-	if o.state == "gone" then
-		cls ..= " sleeping"
-	end
-	local glyph_state = FLEET_GLYPH[o.state] or "idle"
-	local lane_kids: { any } = { glyph(glyph_state, "md", FLEET_LABEL[o.state]) }
-	if o.unread then
-		lane_kids[2] = span("op-udot", nil, "ud")
-	end
-	local meta: { any } = { fleet_badge(o.state) }
-	if o.meta ~= nil then
-		table.insert(meta, span("op-meta-t", o.meta, "t"))
-	end
-	if o.queued ~= nil and o.queued > 0 then
-		table.insert(meta, span("op-fq", string.format("%d queued", o.queued), "q"))
-	elseif o.mailbox == "queued" or o.mailbox == "failed" then
-		table.insert(meta, span("op-fq", "mail " .. o.mailbox, "q"))
-	end
-	if o.pr ~= nil then
-		table.insert(meta, pr_badge(o.pr :: gh.Pr, "pr", o.pr_stale, true))
-	end
-	local stack: { any } = {
-		el("div", { key = "line", class = "op-line", title = o.title .. (if o.meta then "\n" .. o.meta else "") }, {
-			span("op-title", o.title, "title"),
-		}),
-		el("div", { key = "meta", class = "op-meta" }, meta),
-	}
-	local r = o.report
-	if r ~= nil then
-		local text = first_line(r.text) or ""
-		local lead = r.kind .. (if text ~= "" then ": " .. text else "")
-		local row: { any } = {
-			glyph(FLEET_GLYPH[if r.kind == "ask" then "ask" elseif r.kind == "failed" then "failed" else "done"], "sm"),
-			el("span", { class = "op-text", key = "text", title = lead }, { span("op-lead", lead, "lead") }),
-		}
-		local ago = sidebar.ago(snap.now, r.at)
-		if ago ~= nil then
-			table.insert(row, span("op-time", ago, "time"))
-		end
-		table.insert(stack, el("div", { key = "agents", class = "op-agents" }, {
-			el("div", { key = "report", class = "op-row" .. (if o.unread then " unread" else "") }, row),
-		}))
-	end
-	return el("div", { key = key, class = cls, actions = { click = o.click, menu = o.menu } }, {
-		el("div", { key = "row", class = "op-pc" }, {
-			el("div", { key = "lane", class = "op-lane" }, lane_kids),
-			el("div", { key = "stack", class = "op-stack" }, stack),
-		}),
-	})
-end
-
--- "2 working · 1 asks" over a fleet's workers, most urgent first.
-local SUMMARY_ORDER = { "ask", "waiting", "failed", "working", "starting", "done", "idle", "gone" }
-function sidebar.fleet_summary(f: FleetSnap): string
-	local n: { [string]: number } = {}
-	for _, g in f.groups do
-		for _, it in g.items do
-			n[it.state] = (n[it.state] or 0) + 1
-		end
-	end
-	local parts: { string } = {}
-	for _, s in SUMMARY_ORDER do
-		if n[s] then
-			table.insert(parts, string.format("%d %s", n[s], string.lower(FLEET_LABEL[s])))
-		end
-	end
-	return table.concat(parts, " · ")
-end
-
-local function fleet_group(snap: Snapshot, f: FleetSnap, g: FleetGroupSnap): any
-	local ckey = "fgroup:" .. g.key
-	local shut = collapsed(snap, ckey)
-	local menu: { any } = {
-		{ id = act("fleet_group", g.key), label = if g.session_live then "Show session" else "Open session", icon = "folder-open" },
-		{ id = act("toggle_group", ckey), label = if shut then "Expand" else "Collapse", icon = "list" },
-	}
-	local name = g.label .. (if g.creating then " (creating)" elseif g.session_live == false then " (no session)" else "")
-	local children: { any } = {
-		header(glyph_mask("folder-tree", "icon"), name, {
-			toggle = act("fleet_group", g.key),
-			chevron = false,
-			menu = menu,
-			more = act("toggle_group", ckey),
-			more_title = if shut then "Expand group" else "Collapse group",
-			extra = "op-pghead op-fghead",
-		}),
-	}
-	if g.pr ~= nil then
-		-- After the name, before the hover actions.
-		table.insert(children[1].c, 3, pr_badge(g.pr :: gh.Pr, "pr", g.pr_stale, true))
-	end
-	if not shut then
-		for _, it in g.items do
-			if nodes_left > 60 then
-				local click = if it.pane ~= nil and it.state ~= "gone" then act("fleet_focus", it.pane) else act("fleet_group", g.key)
-				children[#children + 1] = fleet_card(snap, key_of("w_", it.name), {
-					title = it.title,
-					state = it.state,
-					meta = it.branch,
-					queued = it.queued,
-					mailbox = it.mailbox,
-					report = it.report,
-					unread = it.unread,
-					pane = it.pane,
-					click = click,
-					extra = "op-fworker",
-					menu = { { id = click, label = "Focus", icon = "terminal" }, menu[1] },
-					pr = it.pr,
-					pr_stale = it.pr_stale,
-				})
-			end
-		end
-	end
-	return el("div", {
-		key = key_of("fg_", g.name),
-		class = "op-pgroup op-fgrp op-nested" .. (if shut then " collapsed" else ""),
-	}, children)
-end
-
-local function fleet_section(snap: Snapshot, f: FleetSnap): any
-	local ckey = "fleet:" .. f.key
-	local shut = collapsed(snap, ckey)
-	local summary = sidebar.fleet_summary(f)
-	local head_node = header(el("span", { key = "icon", class = "op-gicon op-c-fg" }, { icon_node("sparkle") }), f.name, {
-		toggle = act("toggle_group", ckey),
-		chevron = true,
-		extra = "op-fhead",
-	})
-	if summary ~= "" then
-		-- The summary sits after the name, before the hover actions.
-		table.insert(head_node.c, 3, span("op-fsum", summary, "sum"))
-	end
-	local children: { any } = { head_node }
-	if not shut then
-		local c = f.coordinator
-		local click = if c.pane ~= nil then act("fleet_focus", c.pane) else act("toggle_group", ckey)
-		children[#children + 1] = fleet_card(snap, "coord", {
-			title = c.title,
-			state = c.state,
-			meta = if c.session then "coordinator · " .. c.session else "coordinator",
-			queued = c.queued,
-			pane = c.pane,
-			click = click,
-			extra = "op-fcoord",
-			menu = { { id = click, label = "Focus", icon = "terminal" } },
-		})
-		for _, g in f.groups do
-			children[#children + 1] = fleet_group(snap, f, g)
-		end
-	end
-	return el("div", {
-		key = key_of("f_", f.key),
-		class = "op-group op-fleet" .. (if shut then " collapsed" else ""),
-	}, children)
-end
-
 -- Automations ------------------------------------------------------------------
 
 -- A run status's label (automate.luau's statuses).
@@ -1611,15 +1359,8 @@ local function autos_section(snap: Snapshot, s: AutoSnap): any
 	return el("div", { key = "autos", class = "op-group op-autos" .. (if s.open then "" else " collapsed") }, children)
 end
 
-local function fleets(snap: Snapshot, list: { any })
-	for _, f in snap.fleets or {} do
-		list[#list + 1] = fleet_section(snap, f)
-	end
-end
-
 local function workspaces(snap: Snapshot): { any }
 	local list: { any } = {}
-	fleets(snap, list)
 	local pinned = snap.pinned or {}
 	if #pinned > 0 then
 		list[#list + 1] = card_section(snap, "pinned", "pin", "Pinned", pinned, act("toggle_group", "pinned"))

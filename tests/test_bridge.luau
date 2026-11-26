@@ -4,6 +4,7 @@
 local t = require("./support")
 local bridge = require("../bridge")
 local mailq = require("../mailq")
+local rp = require("../remotepure")
 
 local check, eq, test = t.check, t.eq, t.test
 
@@ -136,19 +137,24 @@ test("sigs move only when a node's text changes; the header lists them", functio
 	eq(bridge.sig(s, "gh"), "run.0", "untouched sig")
 	local NULL = {}
 	local h = bridge.header(s, { host = "rig", home = nil, os = "linux", pane = 7, at = 5, leader = nil, null = NULL })
-	eq(h.v, 1, "version")
+	eq(h.v, 2, "version")
+	eq(h.v, rp.VERSION, "the version the window reads")
 	eq(h.host, "rig", "host")
 	eq(h.home, NULL, "missing home is null")
 	eq(h.leader, NULL, "no leader is null")
 	eq(h.pane, 7, "pane")
 	eq(h.sig.status, "run.2", "header sig")
-	for _, name in { "status", "fleet", "gh", "autos", "mail", "replies" } do
+	for _, name in { "status", "gh", "autos", "mail", "replies" } do
 		check(h.sig[name] ~= nil, "sig " .. name)
 	end
 	eq(h.sig.header, nil, "no sig of itself")
-	eq(#bridge.NODES, 7, "seven nodes")
+	eq(#bridge.NODES, 6, "six nodes")
 	eq(bridge.NODES[1], "header", "main.0")
-	eq(bridge.NODES[7], "replies", "main.6")
+	eq(bridge.NODES[6], "replies", "main.5")
+	for i, name in rp.NODES do
+		eq(bridge.NODES[i + 1], name, "the window's node order: " .. name)
+		eq(rp.INDEX[name], i, "the window's index: " .. name)
+	end
 end)
 
 test("mail_doc keeps only queued messages and reads back with normalize", function()
@@ -232,7 +238,7 @@ test("tern_cli tries TERN_EXE, the app, the Linux installs, then PATH", function
 	eq(bridge.tern_cli(env({ HOME = "/h" }), exists_of({})), "tern", "PATH")
 end)
 
-test("the discovery path follows tern_fleet.py's config dir rule", function()
+test("the discovery path follows Tern's config dir rule", function()
 	eq(bridge.config_dir(env({ TERN_CONFIG_DIR = "/c", HOME = "/h" }), "linux"), "/c", "TERN_CONFIG_DIR")
 	eq(bridge.config_dir(env({ HOME = "/h" }), "macos"), "/h/Library/Application Support/Tern", "macOS")
 	eq(bridge.config_dir(env({ HOME = "/h", XDG_CONFIG_HOME = "/x" }), "linux"), "/x/tern", "XDG")

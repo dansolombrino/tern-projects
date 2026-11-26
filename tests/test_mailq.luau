@@ -15,7 +15,7 @@ local function no()
 end
 
 local function req(id, target, text)
-	return { op = "deliver", id = id, target = target, text = text or "hello", from = "agent-fleet g/item" }
+	return { op = "deliver", id = id, target = target, text = text or "hello", from = "script g/item" }
 end
 
 test("deliver validates, stores once per id, and refuses unmatched targets", function()

@@ -1,5 +1,5 @@
 --!strict
--- projects, mail: the window half of the fleet mailbox (README "Fleet mailbox"). The host half keeps the queue
+-- projects, mail: the window half of the mailbox (README "Mailbox"). The host half keeps the queue
 -- (kv `mailbox.v1`) and serves the socket; this half
 --
 -- - runs a `mailbox.py watch` child whose output lines wake this window (Tern stalls an idle window's timers) as

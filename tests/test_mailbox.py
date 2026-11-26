@@ -117,7 +117,7 @@ class HelperTest(unittest.TestCase):
 
 
 class DiscoveryTest(unittest.TestCase):
-    """--discovery: the same mailbox.json where agent-fleet scripts look when the data dir is elsewhere (Linux)."""
+    """--discovery: the same mailbox.json where scripts look when the data dir is elsewhere (Linux)."""
 
     def start(self) -> subprocess.Popen:
         p = subprocess.Popen(

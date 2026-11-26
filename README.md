@@ -10,9 +10,9 @@ agents per project** (each a workspace card), and **subagents per agent**.
   In a git project each agent works in a git worktree of its own.
 - A subagent is a child omp agent started from a parent agent: it opens as a split beside the
   parent, in the parent's folder (and worktree). When the child's turn ends, its last message is
-  sent to the parent (report-back, through the fleet mailbox).
-- A **fleet mailbox** takes messages for agents from scripts (agent-fleet) over a Unix socket and
-  delivers each into its agent's chat when the agent is idle (see *Fleet mailbox*).
+  sent to the parent (report-back, through the mailbox).
+- A **mailbox** takes messages for agents from scripts over a Unix socket and delivers each into its
+  agent's chat when the agent is idle (see *Mailbox*).
 - omp's own subagents (its task tool) are read from the parent's surface and shown nested under the
   agent, read-only.
 
@@ -54,9 +54,8 @@ folders). Its header shows the host (`rig-4090`), and everything about it runs t
 - git (worktrees, branches, Delete's status, worktree remove, branch delete), folder checks, clone and create
   run on that host; Add project's **Browse folder** is a picker over that host's folders (`.. (up)`, *Use this
   folder*, *Type a path…*, the subfolders), starting at its home;
-- its branch reads, GitHub polling (`gh` on that host), fleets (that host's `agent-fleet` state), mailbox and
-  automations are that host's host half's; the sidebar shows them beside this machine's, remote ones tagged
-  with the host (`remote-check · rig-4090`);
+- its branch reads, GitHub polling (`gh` on that host), mailbox and automations are that host's host half's; the
+  sidebar shows them beside this machine's, remote ones tagged with the host (`remote-check · rig-4090`);
 - *Open in Finder* becomes *Open terminal on rig-4090* (a shell there, in the folder).
 
 **How** (`bridge.luau`, `host.luau`; `remote.luau`, `remotepure.luau`). Tern gives a plugin no channel between a
@@ -64,16 +63,17 @@ window and another machine's host half, but a plugin block runs in the host half
 the window reads its view and sends it events. So the host half defines block `projects.bridge`; a window opens
 one on a remote host (once, while that host is current) and parks it (it sits in *no tab* of a session there,
 out of sight). Its view is the host's state as JSON text: a header (signatures and chunk counts), then status,
-fleets, GitHub, automations, queued mail and request replies, each cut into ≤ 30000-byte text nodes (a window
+GitHub, automations, queued mail and request replies, each cut into ≤ 30000-byte text nodes (a window
 reads at most 64000 characters per read). The window polls the header every 2 s and re-reads only the parts
 whose signature moved, one chunk per callback. Requests (`git`, `fs`, `spool`, `sync`, `hello`) go to the
 block as events and answers come back in its replies part. `sync` tells the host which projects of the window's
 list live there (kept in its kv `projects.hostsync.v1`), so its GitHub polling, branch reads and automations
 see them. Pane ids differ between a host and the window (a host id `hi·2³² + lo` shows as `base + hi·2²⁴ + lo`):
-the window derives `base` from the bridge and checks it against the host's panes before using it.
+the window derives `base` from the bridge and checks it against the host's panes before using it. The header's `v`
+is the view's layout (2); a window reads only a host whose bridge has the same, so update the plugin on both.
 
 The first window to say `hello` to a host delivers that host's mail and starts its pane automations (only while
-that host is current; otherwise the run goes headless after 20 s). Automations, fleets and the mailbox of a
+that host is current; otherwise the run goes headless after 20 s). Automations and the mailbox of a
 remote host run in its daemon with no window: a schedule fires and a headless run finishes with the Mac asleep.
 
 ## Sidebar
@@ -85,9 +85,8 @@ Orca's layout, top to bottom (`sidebar.luau`, `sidebar.css`):
 - **Projects** header (*Workspaces* when not grouped by project): collapse or expand all (shown on
   hover; also Alt-click any header), the **Activity** bell with its count (agents needing input, else
   working), **Workspace options**, **Add project**, **New agent**.
-- The list: *Fleets* (one section per agent fleet, see below), a *Pinned* section, then project
-  groups with their projects, then ungrouped projects, then *Unassigned* for agents outside every
-  project. Top-level headers stick while their section scrolls.
+- The list: a *Pinned* section, then project groups with their projects, then ungrouped projects, then
+  *Unassigned* for agents outside every project. Top-level headers stick while their section scrolls.
 - Footer: **Settings**, **Help**, and **Reveal active workspace** (expands the groups above the
   focused agent's card and glows it).
 
@@ -123,46 +122,14 @@ One card per top-level agent, in Orca's new card style:
   every agent in the worktree, removes the worktree with `--force`, then deletes its branch with
   `git branch -d`. A branch git won't delete safely is kept, and you are offered to force it.
 
-### Fleets
-
-Agent fleets started with the agent-fleet skill's Tern adapter (`tern_fleet.py`) show above the
-projects the way Orca shows them: one section per fleet, its groups as containers, their workers as
-cards. Live: the host half re-reads the fleet state every 2 s and the sidebar redraws only the fleet
-that changed.
-
-- **Fleet row**: the fleet's name and a summary of its workers (`1 asks · 2 working · 1 done`). A
-  click collapses it.
-- **Coordinator card** (`L0 <fleet>`): its state (working, idle, needs you, gone), the session its
-  tab is in now, and how many mailbox messages wait for it. A click focuses it.
-- **Group row** (`G <group> · <fleet>`, or `l0-<group>` for a legacy group): a click shows the group's
-  session, or opens it again in the container worktree when it was ended; `…` collapses it. Every tab
-  of a group's session gets the group's color (one per group, stable), once per tab and only when the
-  tab has none, so a color you set stays.
-- **Worker card** (`L1 <group>/<item>`): a status dot and badge, *Working*, *Idle*, *Asks* (it asked
-  the coordinator and waits for the answer), *Needs you* (its agent waits for input in its pane),
-  *Done*, *Failed*, *Starting* or *Gone* (no pane in its worktree; dimmed); its branch; mail still
-  queued for it; and its last report (`ask: …`, `done: …`, `failed: …`) with its age. A report that
-  came after the coordinator was last focused is unread (amber dot, bold title) until you focus the
-  coordinator. A click focuses the worker (a gone one shows its group's session).
-- A fleet's coordinator and workers show only here, not again as project or *Unassigned* cards.
-- A group closed out (`close-out --confirm` archives it to `.closed/`) leaves the sidebar on the
-  next scan; a closed item (status `removed`) and a coordinator chat with no group left are hidden.
-
-Where it reads: the adapter's state root, `$AGENT_FLEET_STATE_DIR`, else `$XDG_STATE_HOME/agent-fleet`,
-else `~/.local/state/agent-fleet`, as Tern's daemon sees its environment; under it `.tern/<repo id>/`
-holds the coordinator chats (`chats/<key>/state.json`) and legacy `l0-<group>` groups
-(`<group>/state.json`). The plugin only reads them: a state file the script is replacing (missing
-beside its `.state.json.<pid>.tmp`, or half written) keeps the last good read, and a corrupt one with
-no earlier read is skipped. The model goes to `<data>/fleet.json` (`fleet.luau`, `fleets.luau`).
-
 ### Pull requests and issues
 
 Orca's PR and issue views, read with the GitHub CLI (`gh`, logged in: `gh auth login`). Only repositories with a
 github.com remote take part (`origin`, else the first github.com remote); a folder with no remote, or another host,
 shows nothing and costs no `gh` call.
 
-- **PR badge** on every card whose branch has a pull request: project worktree cards, fleet worker cards and fleet
-  group rows. It shows the number and state (`#12 open`, `draft`, `merged`, `closed`, in GitHub's colors), a CI dot
+- **PR badge** on every card whose branch has a pull request (project worktree cards).
+  It shows the number and state (`#12 open`, `draft`, `merged`, `closed`, in GitHub's colors), a CI dot
   (green pass, red fail, amber running; none without checks), the review mark (✓ approved, ✗ changes requested,
   • review required) and `!` on conflicts; the tooltip spells it out. A click opens the PR in the system browser.
   The PR of a branch is its open PR, else the newest merged one, else the newest closed one; a PR from a fork is
@@ -212,8 +179,8 @@ a project or folder, with run history, enable/disable and Run now. The **Automat
 - Palette: **New automation** (name, schedule, prompt, where, how), **Edit automations (automations.json)**,
   **Automation runs**, **Run automation now**.
 
-**Definitions** are a JSON file you edit, `<data>/automations.json` (`<data>` is the plugin's data dir, see *Fleet
-mailbox*); the palette's New automation and the pause switch write it too (pretty-printed, keys in a fixed order,
+**Definitions** are a JSON file you edit, `<data>/automations.json` (`<data>` is the plugin's data dir, see
+*Mailbox*); the palette's New automation and the pause switch write it too (pretty-printed, keys in a fixed order,
 unknown keys kept). A file that is not valid JSON keeps the last good definitions and says so in the section.
 
 ```json
@@ -416,22 +383,18 @@ The plugin keeps under it the way Overseer's `budget.luau` does (`budget.luau` h
 - The sidebar's width is re-measured (three `resize` probes) at most every 10 s, not every tick.
 - Reads are capped: 600 surface nodes per agent, every 6 s while it works and every 30 s while idle;
   6 transcript messages per prompt read; the keymap is read at most every 30 s.
-- Fleet state files are read and parsed by the host half (2 s budget, on its 2 s clock; an unchanged
-  file's text skips the parse), never by a window: a window re-reads the small `<data>/fleet.json`
-  only when `fleet_sig` in status.json changed. status.json also carries `fleet_ms` and
-  `fleet_ms_max`, the host's last and longest fleet scan (a scan over 200 ms is logged).
 - GitHub output is parsed by the host half (gh.luau, on its 5 s clock); a window re-reads the compact `<data>/gh.json`
   only when `gh_sig` in status.json changed, in a timer callback of its own (logged when over 25 ms), and a change
-  redraws only the sections it touches (a project's section, a fleet).
+  redraws only the sections it touches (a project's section).
 - Automations are scheduled by the host half (2 s clock; a tick re-reads `automations.json` only when its text
   changed, and takes well under 1 ms with a few automations: `auto_ms` in status.json). A window reads the small
   `autos.sig` on each mailbox watcher line (about every 3 s) and `autos.json` only when it changed, in a callback of
   its own; the leader starts at most one pane run per callback, and checks running pane runs (one
   `cx.agents:list()`) only while some run. The section is one list part, so a change redraws only it.
 
-## Fleet mailbox
+## Mailbox
 
-Scripts (the agent-fleet skill) send messages to agents through the plugin: durable, delivered with
+Scripts send messages to agents through the plugin: durable, delivered with
 `cx.agents:ask` (one atomic omp send) only while the agent is idle or waiting for input, never
 mid-turn (tern-sdk#320).
 
@@ -491,7 +454,7 @@ message twice. Subagent report-backs go into the same queue the same way.
 
 - Delivery needs an open Tern window (`cx.agents` exists only in a window). With none, messages wait
   queued, and `deliver` still answers. On a remote host (see *Remote hosts*) that means a window attached to
-  it: checked 2026-11-23, a message `tern_fleet.py` queued on rig-4090 while no window was attached stayed
+  it: checked 2026-11-23, a message a script queued on rig-4090 while no window was attached stayed
   `queued` and went out as soon as the Mac window was attached to it again.
 - Only omp agents Tern knows as agents (`cx.agents`), in a window attached to the queue's host, are targets.
 - Delivery is into the agent's chat as a prompt; nothing shows a message before then.
@@ -534,7 +497,7 @@ Stored with `tern.kv` (the plugin's `kv.json`, shared by every window) under `pr
   card. Other records go when their block closes, or an hour after their pane vanished without a
   close (a restart that did not bring it back).
 
-The fleet mailbox is under `mailbox.v1` (written by the host half only). GitHub settings are under
+The mailbox is under `mailbox.v1` (written by the host half only). GitHub settings are under
 `projects.gh.v1` (see *Pull requests and issues*); the GitHub data itself is in `<data>/gh.json`, not kv. Automation
 state (each automation's next run and run counter, the run history) is under `automations.v1` (written by the host
 half only); the definitions are `<data>/automations.json` and headless output is in `<data>/autoruns/` (see
@@ -542,12 +505,11 @@ half only); the definitions are `<data>/automations.json` and headless output is
 
 The sidebar's state is under `projects.ui.v1`: whether it shows, its width, the collapsed sections,
 the list shown (projects or Activity), the workspace options, the pinned and unread cards, whether
-Delete asks, when each fleet's coordinator was last focused (`fleet_seen`, for unread reports), and
-which projects' "PRs & issues" are expanded (`prs_open`). The Automations section's collapsed state is
-`collapsed.automations`.
+Delete asks, and which projects' "PRs & issues" are expanded (`prs_open`). The Automations section's collapsed
+state is `collapsed.automations`.
 
 Files: `plugin.toml` (manifest; `styles` loads the two sheets), `host.luau` (the host half: mailbox
-queue and helper, pane sessions and branches, the fleet scan, GitHub polling), `mailbox.py` (the socket helper), `window.luau`
+queue and helper, pane sessions and branches, GitHub polling), `mailbox.py` (the socket helper), `window.luau`
 (commands, hooks, chrome and staged loading), `base.luau` (the constants the load needs), `events.luau` (what the
 hooks, clicks and status segment do, and `init`), `core.luau` (the shared state, the agent scan, lookups),
 `budget.luau` (labelled, timed callbacks), `identity.luau` (records ↔ panes), `mailq.luau` (the
@@ -555,9 +517,8 @@ mailbox queue), `mail.luau` (mailbox delivery and report-back in a window), `pla
 sidebar's docking, width and refresh), `snapshot.luau` (what the sidebar draws), `agents.luau`
 (starting agents, worktrees, report-back, sleep, wake, delete), `projects.luau` (project and group
 flows), `pickers.luau` (search, options, settings, help, Orca shortcuts), `model.luau` (data,
-ordering and persistence), `subagents.luau` (omp surface → subagents), `fleet.luau` (agent-fleet
-state → the fleet model, pure), `fleets.luau` (fleets in a window: states, clicks, unread, tab colors),
-`gh.luau` (GitHub remotes, gh JSON, CI rollup, branch → PR, the refresh clock; pure), `ghpoll.luau` (gh polling in
+ordering and persistence), `subagents.luau` (omp surface → subagents), `gh.luau` (GitHub remotes, gh JSON, CI
+rollup, branch → PR, the refresh clock; pure), `ghpoll.luau` (gh polling in
 the host half), `prs.luau` (PRs and issues in a window: badges, lists, open, refresh, create), `sched.luau`
 (schedules and their occurrences; pure), `automate.luau` (automation definitions, the scheduler tick, history; pure),
 `autohost.luau` (automations in the host half: the clock, runs, files), `autowin.luau` (automations in a window: the
@@ -596,7 +557,7 @@ And the port's own:
   folder holds several agents stays unattached (it still shows, attributed by folder).
 - Report-back fires on every turn end of a spawned subagent (`done` or `failed`) that produced a new
   answer (omp's stats footer stripped), while the parent agent has a live pane or a known session
-  file. It goes through the fleet mailbox: durable, delivered at the parent's next idle.
+  file. It goes through the mailbox: durable, delivered at the parent's next idle.
 - An agent's finished, failed or interrupted state is kept in memory: a plugin reload forgets it.
 - omp-internal subagents are read from at most 600 surface nodes per agent; a longer transcript
   can hide older ones. They are read only while the sidebar shows.
@@ -610,6 +571,5 @@ And the port's own:
 - The title-bar button and `⌃⌘E` toggle the sidebar instead of Files while the plugin is installed.
 - `chrome.css` hides the parked sidebar's card by its label (`Projects · …`), so a parked pane of
   your own titled "Projects" is hidden from the park pile too.
-- The sidebar follows you into a fleet group's session; a close-out that ends that session while
-  the sidebar shows there ends the sidebar with it (Tern gives no event before a session ends), and
-  the toggle opens it again.
+- The sidebar follows you into another session; ending that session while the sidebar shows there ends the
+  sidebar with it (Tern gives no event before a session ends), and the toggle opens it again.

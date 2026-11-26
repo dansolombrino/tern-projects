@@ -9,7 +9,8 @@ local mailq = require("./mailq")
 
 local bridge = {}
 
-bridge.VERSION = 1
+-- The view's layout; remotepure.VERSION must match (2: one node fewer after status, the later nodes moved up).
+bridge.VERSION = 2
 -- A window that said nothing for this long is gone (it says hello every few seconds).
 bridge.LIVE_S = 15
 -- How long a reply stays in the view for its window to read it.
@@ -23,8 +24,8 @@ bridge.GIT_TIMEOUT_MS = 30000
 bridge.GIT_TIMEOUT_MAX_MS = 120000
 -- The kv key of the synced project list.
 bridge.SYNC_KEY = "projects.hostsync.v1"
--- The view's text nodes, in their fixed order (main.0 .. main.6).
-bridge.NODES = { "header", "status", "fleet", "gh", "autos", "mail", "replies" }
+-- The view's text nodes, in their fixed order (main.0 .. main.5).
+bridge.NODES = { "header", "status", "gh", "autos", "mail", "replies" }
 
 export type Request = { [string]: any }
 export type SyncProject = { id: string, name: string, root: string }
@@ -237,7 +238,7 @@ function bridge.prune_replies(replies: Replies, now: number): boolean
 	return gone
 end
 
--- main.6: `{ [id] = reply }`.
+-- main.5: `{ [id] = reply }`.
 function bridge.replies_doc(replies: Replies): { [string]: any }
 	local out: { [string]: any } = {}
 	for id, r in replies do
@@ -317,7 +318,7 @@ function bridge.header(
 	}
 end
 
--- main.5: the queued messages only, in kv `mailbox.v1`'s shape (mailq.normalize reads it back).
+-- main.4: the queued messages only, in kv `mailbox.v1`'s shape (mailq.normalize reads it back).
 function bridge.mail_doc(box: mailq.Box): { seq: number, msgs: { mailq.Msg } }
 	local msgs: { mailq.Msg } = {}
 	for _, m in box.msgs do
@@ -401,7 +402,7 @@ function bridge.tern_cli(getenv: (string) -> string?, exists: (string) -> boolea
 	return "tern"
 end
 
--- Tern's config dir as tern_fleet.py finds it: $TERN_CONFIG_DIR, else macOS's Application Support, else XDG's.
+-- Tern's config dir: $TERN_CONFIG_DIR, else macOS's Application Support, else XDG's.
 function bridge.config_dir(getenv: (string) -> string?, os_name: string): string?
 	local dir = getenv("TERN_CONFIG_DIR")
 	if dir and dir ~= "" then

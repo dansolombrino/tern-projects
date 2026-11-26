@@ -1,5 +1,5 @@
 --!strict
--- projects, mailq: the fleet mailbox's queue (protocol v1, README "Fleet mailbox"). The host half owns it: it is
+-- projects, mailq: the mailbox's queue (protocol v1, README "Mailbox"). The host half owns it: it is
 -- the only writer of kv key `mailbox.v1`, so a reply of `queued` means the message is in kv.json. The window half
 -- reads it, delivers with `cx.agents:ask` when the target is idle, and reports each delivery back through a spool
 -- file the host applies.
